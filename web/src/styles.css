@@ -82,37 +82,6 @@ body,
   color: var(--text-mute);
   font-weight: 500;
 }
-
-.stats {
-  display: flex;
-  align-items: center;
-  gap: 22px;
-  margin-left: auto;
-}
-.stats__sep {
-  width: 1px;
-  height: 26px;
-  background: var(--line);
-}
-.stat {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  line-height: 1.05;
-}
-.stat__n {
-  font-family: var(--font-display);
-  font-size: 18px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-.stat__l {
-  font-size: 11px;
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  margin-top: 2px;
-}
 .addbtn {
   border: 1px solid var(--line);
   background: none;
@@ -853,26 +822,6 @@ body,
 .maplabels--focus {
   filter: grayscale(1);
 }
-.soundbtn {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: none;
-  color: var(--text-mute);
-  font-family: var(--font-display);
-  font-size: 14px;
-  cursor: pointer;
-  line-height: 1;
-}
-.soundbtn:hover {
-  color: var(--text);
-  background: var(--panel-2);
-}
-.soundbtn--on {
-  color: var(--accent-2);
-  border-color: rgba(94, 234, 212, 0.4);
-}
 
 .conn {
   display: flex;
@@ -1101,7 +1050,6 @@ body,
   -webkit-app-region: drag; /* the topbar is the window's drag handle */
 }
 .electron .topbar button,
-.electron .topbar .stats,
 .electron .topbar .conn {
   -webkit-app-region: no-drag;
 }
@@ -1181,7 +1129,6 @@ body,
 }
 
 /* Anything you press. Bevelled up, and it goes DOWN when you press it. */
-.soundbtn,
 .addbtn,
 .rs__btn,
 .rs__x,
@@ -1279,7 +1226,6 @@ body,
 }
 
 /* Labels in the chrome take the display face, spaced out like a sprite sheet. */
-.stat__l,
 .rs__label,
 .palette__section,
 .ap__state,
@@ -1372,12 +1318,6 @@ body,
 }
 
 /* ---- room settings: team section ---------------------------------------- */
-.rs__teamRow {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin: 8px 0;
-}
 .rs__chip {
   font-family: var(--font-display);
   font-size: 11px;
@@ -1395,29 +1335,6 @@ body,
   background: #16324f;
 }
 .rs__chip:active { box-shadow: inset 0 0 0 1px var(--line); transform: translate(3px, 3px); }
-.rs__capRow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.rs__cap { width: 64px; }
-.rs__hireTeam {
-  display: block;
-  width: 100%;
-  margin-top: 8px;
-  font-family: var(--font-display);
-  font-size: 12px;
-  letter-spacing: 0.05em;
-  padding: 8px 12px;
-  background: #16324f;
-  color: #cfe3ff;
-  border: 2px solid var(--px-edge);
-  box-shadow: inset 0 0 0 1px var(--line), var(--px-drop-sm);
-  cursor: pointer;
-}
-.rs__hireTeam:disabled { opacity: 0.45; cursor: not-allowed; }
-.rs__hireTeam:not(:disabled):hover { background: #1a3b5e; }
-.rs__hireTeam:not(:disabled):active { box-shadow: inset 0 0 0 1px var(--line); transform: translate(3px, 3px); }
 
 /* Rescued from src/index.css, which was never imported — the session list has
    been rendering unstyled (title and status running together on one line)

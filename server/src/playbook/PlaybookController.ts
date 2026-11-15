@@ -20,7 +20,8 @@ import { sanitiseRules } from './rules';
  */
 
 export interface PlaybookDeps {
-  controller: AgentController;
+  /** Extraction is a one-off question to the model, so the engine must answer `ask`. */
+  controller: AgentController & Required<Pick<AgentController, 'ask'>>;
   /** The session's steps, all of them — extraction reads the whole thing. */
   getTranscript: (sessionId: string, limit: number) => Promise<{ steps: Step[] }>;
   onUpdate: (u: RunUpdate) => void;
@@ -76,7 +77,6 @@ export class PlaybookController {
    * first one's result.
    */
   async draft(sessionId: string, roomId: string): Promise<{ draft?: Playbook; error?: string }> {
-    if (!this.deps.controller.ask) return { error: 'Playbooks need the SDK engine (unset AIROOM_ENGINE=cli).' };
     if (this.drafting.has(sessionId)) return { error: 'Still reading that session — one moment.' };
     this.drafting.add(sessionId);
     try {

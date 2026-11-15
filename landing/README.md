@@ -12,12 +12,42 @@ node landing/server.mjs
 
 ## Deploy on Railway
 
-The Railway and DNS notes are in [`../DEPLOY.md`](../DEPLOY.md). The short
-version: one service, **Root Directory `landing`**, custom domain `airoom.dev`
-(an ALIAS record at the apex, never a CNAME, plus Railway's verification TXT).
-`railway.json` sets the start command and the `/health` check.
+The site and the download redirect are one Railway service. There is nothing
+else to run: the installers live on GitHub Releases and the app talks to no
+backend of ours.
+
+1. Railway → New project → **Deploy from GitHub repo** → this repository.
+2. Service settings → **Root Directory `landing`**. `railway.json` sets the
+   start command and the `/health` check, so a broken build never replaces a
+   working one.
+3. Settings → **Networking → Custom Domain** → `airoom.dev`. At Porkbun the
+   bare domain needs an **ALIAS** record, not a CNAME: a CNAME at the apex is
+   illegal and would break the MX records that `hello@airoom.dev` runs on.
+   Add Railway's **verification TXT record** as well. Without it the domain
+   resolves, terminates TLS and then answers nothing, which looks like a
+   broken deploy rather than a missing DNS record.
+
+To check a deploy:
+
+```bash
+curl -s https://airoom.dev/health
+```
+
+```bash
+curl -sI https://airoom.dev/download | grep -i location
+```
+
+```bash
+curl -s https://airoom.dev/release.json
+```
+
+The first answers `{"ok":true,...}`, the second names the release asset, the
+third is what every running copy of the app reads to learn that a build is
+out.
 
 ## Variables
+
+All optional; the defaults are what production runs with.
 
 | Variable | Effect |
 | --- | --- |
@@ -40,8 +70,8 @@ The asset names are stable (`airoom-arm64.dmg`, `airoom-x64.exe`), so
 `releases/latest/download/<name>` always resolves and a release needs no
 change here beyond `release.json`.
 
-`/buy` answers a redirect to the front page: airoom used to be sold there, and
-builds up to 0.1.16 still carry the link.
+`/buy` answers a redirect to the front page, for builds up to 0.1.16 that
+still link to it.
 
 ## The waitlist
 

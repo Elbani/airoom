@@ -5,8 +5,8 @@
 //   302s to DOWNLOAD_URL, which defaults to the asset on the latest GitHub
 //   release.
 // - GET /download?os=windows → the same for the Windows installer.
-// - GET /buy → 302 to the front page. airoom used to be sold there, and
-//   builds up to 0.1.16 still carry the link.
+// - GET /buy → 302 to the front page, for builds up to 0.1.16 that still
+//   link to it.
 // - POST /waitlist → forwarded to WAITLIST_URL when one is set (the hosted
 //   team office's waitlist); 503 otherwise, which the page turns into an
 //   email address.

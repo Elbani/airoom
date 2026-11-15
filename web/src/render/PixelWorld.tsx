@@ -66,17 +66,6 @@ interface Props {
   onExitEdit: () => void;
 }
 
-function relTime(iso: string | null): string {
-  if (!iso) return '';
-  const s = Math.round((Date.now() - Date.parse(iso)) / 1000);
-  if (Number.isNaN(s)) return '';
-  if (s < 60) return `${s}s`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.round(m / 60);
-  return h < 24 ? `${h}h` : `${Math.round(h / 24)}d`;
-}
-
 /**
  * Room names, the way a map labels a place.
  *

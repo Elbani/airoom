@@ -100,6 +100,10 @@ const META: Record<string, ToolMeta> = {
   Agent: { Icon: IconAgent, color: '#6fa79b' },
   WebFetch: { Icon: IconGlobe, color: '#7f9bb8' },
   WebSearch: { Icon: IconGlobe, color: '#7f9bb8' },
+  // airoom's own browser pane (the tools arrive described as "Browser")
+  Browser: { Icon: IconGlobe, color: '#6fa79b' },
+  // the user's own Chrome, through Claude in Chrome
+  Chrome: { Icon: IconGlobe, color: '#6fa79b' },
   TodoWrite: { Icon: IconList, color: '#8494ad' },
 };
 

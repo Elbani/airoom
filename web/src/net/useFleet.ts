@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   AgentSkills,
+  BrowserAgents,
+  ChromeCheck,
   ClientMessage,
   CommandChoice,
   ImageAttachment,
@@ -157,6 +159,10 @@ export function useFleet() {
   /** The newest connector tool call — the render layer's cable pulse. */
   const [mcpPulse, setMcpPulse] = useState<{ seq: number; sessionId: string; roomId: string; server: string } | null>(null);
   const pulseSeqRef = useRef(0);
+  /** Where agents browse, as the server last said. */
+  const [browserAgents, setBrowserAgentsState] = useState<BrowserAgents | null>(null);
+  /** The last word on whether agents can use the user's Chrome. */
+  const [chromeCheck, setChromeCheck] = useState<ChromeCheck | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const retryRef = useRef(0);
@@ -384,6 +390,10 @@ export function useFleet() {
         setPlaybookDrafts((prev) => ({ ...prev, [msg.sessionId]: { loading: false, draft: msg.draft, error: msg.error } }));
       } else if (msg.type === 'connectors') {
         setConnectors((prev) => ({ ...prev, [msg.room.roomId]: msg.room }));
+      } else if (msg.type === 'browserSettings') {
+        setBrowserAgentsState(msg.agents);
+      } else if (msg.type === 'chromeCheck') {
+        setChromeCheck(msg.check);
       }
     };
 
@@ -768,7 +778,13 @@ export function useFleet() {
     [wsSend],
   );
 
+  /** Where agents browse. The server checks Chrome itself, and says so. */
+  const setBrowserAgents = useCallback((agents: BrowserAgents) => wsSend({ v: 1, type: 'setBrowserAgents', agents }), [wsSend]);
+
   return {
+    browserAgents,
+    chromeCheck,
+    setBrowserAgents,
     connectors,
     mcpPulse,
     listConnectors,

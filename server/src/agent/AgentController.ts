@@ -41,6 +41,41 @@ export interface SendOptions {
   allowRules?: string[];
 }
 
+/**
+ * Equipment the HOST hands to every run it starts, whoever asked for the run:
+ * a chat message, a team, a playbook. The controller merges it in without
+ * knowing what it is (today: the browser pane's tools).
+ */
+export interface RunExtras {
+  /** In-process MCP servers, merged with whatever the caller passed. */
+  mcpServers?: Record<string, unknown>;
+  /**
+   * Answers "may this call run without a card?" from the call itself, where a
+   * name prefix is too blunt: opening localhost is fine, opening someone's
+   * website is a question for the human. `{ rules }` allows the call and hands
+   * those of the runtime's suggested rules back with it, so the calls that
+   * follow under them do not ask either.
+   */
+  autoAllowTool?: (toolName: string, input: Record<string, unknown>, suggestions?: unknown[]) => boolean | { rules: unknown[] };
+  /** Flags for the Claude Code CLI, the way the SDK passes them: `{ chrome: null }` is `--chrome`. */
+  extraArgs?: Record<string, string | null>;
+  /**
+   * Run on Claude Code's own sign-in rather than the token pasted into
+   * airoom. Claude in Chrome refuses long-lived tokens.
+   */
+  ownLogin?: boolean;
+  /** More for the system prompt, after whatever the caller already appends. */
+  systemPromptAppend?: string;
+}
+
+/** What a run tells the host about itself when it asks for its extras. */
+export interface RunExtrasContext {
+  roomId: string;
+  runKey: string;
+  /** Read at call time: a fresh hire has no session id until the runtime names it. */
+  sessionId: () => string | null;
+}
+
 /** What a one-shot question to the model comes back as. */
 export type AskResult = { ok: true; text: string } | { ok: false; error: string };
 

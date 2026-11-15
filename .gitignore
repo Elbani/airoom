@@ -20,3 +20,6 @@ landing/downloads/
 marketing/
 design/demo-video/
 design/*-20??-??-??.md
+
+# Each person's own preview servers for the Claude desktop app.
+.claude/launch.json

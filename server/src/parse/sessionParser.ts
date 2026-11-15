@@ -1,5 +1,5 @@
 import type { Robot, RobotStatus, Step } from '../../../shared/types';
-import { describeTool, toolLabel } from '../../../shared/describeTool';
+import { describeTool } from '../../../shared/describeTool';
 
 // A "working" session whose last activity is older than this is really parked.
 const IDLE_MS = 8 * 60 * 1000; // 8 minutes
@@ -11,6 +11,8 @@ const ATTENTION_MS = 10 * 60 * 1000; // 10 minutes
 // the chat can scroll, so it is generous: a long working session easily passes
 // a thousand events, and stopping at 150 made the panel feel truncated.
 export const MAX_STEPS = 20000;
+/** The steps a desk shows, and all an office parse needs to keep. */
+export const RECENT_STEPS = 8;
 
 /** Raw JSONL record — we only rely on a handful of fields, rest is unknown. */
 interface Rec {
@@ -200,11 +202,6 @@ function stepId(r: Rec, ordinal: number): string {
   return `${r.uuid ?? r.timestamp ?? 'x'}#${ordinal}`;
 }
 
-function pushStep(steps: Step[], s: Step) {
-  steps.push(s);
-  if (steps.length > MAX_STEPS) steps.shift();
-}
-
 /**
  * Parse one session's JSONL text into a Robot model.
  * Pure and side-effect free so it's trivially testable.
@@ -215,24 +212,36 @@ function pushStep(steps: Step[], s: Step) {
  * that's the room the robot belongs to.
  */
 export function parseSession(raw: string, fallbackId: string, projectDirName?: string): Robot | null {
-  return parseInternal(raw, fallbackId, projectDirName).robot;
+  return parseInternal(raw, fallbackId, projectDirName).robot();
 }
 
-function parseInternal(
-  raw: string,
-  fallbackId: string,
-  projectDirName?: string,
-): { robot: Robot | null; steps: Step[] } {
-  const records: Rec[] = [];
+function parseInternal(raw: string, fallbackId: string, projectDirName?: string): SessionParse {
+  const parse = createSessionParse(fallbackId, projectDirName);
   for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
     try {
-      records.push(JSON.parse(line));
+      if (line.trim()) parse.add(JSON.parse(line));
     } catch {
       /* tolerate partial/corrupt trailing line */
     }
   }
+  return parse;
+}
 
+/**
+ * A session being read a record at a time, so a caller can stream a file of
+ * any size through it and later feed it only what was appended.
+ */
+export interface SessionParse {
+  /** One parsed transcript line. Anything else is ignored, never thrown on. */
+  add(record: unknown): void;
+  /** The robot as of the records seen so far. */
+  robot(): Robot | null;
+  /** The newest steps, up to the number the parse keeps. The live list: copy before keeping it. */
+  steps(): Step[];
+}
+
+/** `keep` bounds the steps held: a few for an office desk, all of them for an open chat. */
+export function createSessionParse(fallbackId: string, projectDirName?: string, keep = MAX_STEPS): SessionParse {
   const cwds: string[] = []; // ordered, unique — first is the session's origin
   let gitBranch: string | undefined;
   let version: string | undefined;
@@ -243,11 +252,16 @@ function parseInternal(
   let lastTs: string | null = null;
 
   const steps: Step[] = [];
+  const pushStep = (st: Step) => {
+    steps.push(st);
+    if (steps.length > keep) steps.shift();
+  };
   let messageCount = 0;
 
-  const toolUses = new Map<string, { name: string; input: any }>();
+  // Calls still waiting for their result, oldest first, each as a line (not
+  // its input: a Write's input is the whole file it wrote).
+  const toolUses = new Map<string, { name: string; label: string }>();
   let seq = 0; // monotonic per parse — deterministic for a given file
-  const resolved = new Set<string>();
   // What was the last meaningful event? Drives status.
   let lastEvent: 'user' | 'assistant_text' | 'assistant_tool' | 'tool_result' | 'system' | null =
     null;
@@ -260,10 +274,10 @@ function parseInternal(
   // panel insisting the session was open in a terminal. Remember it instead.
   let interrupted = false;
 
-  for (const r of records) {
+  const add = (r: Rec): void => {
     // Sidechain records are subagent (Task) traffic, not the user's
     // conversation — they must never shape the robot's room, status, or chat.
-    if (r.isSidechain) continue;
+    if (r.isSidechain) return;
     if (r.cwd && !cwds.includes(r.cwd)) cwds.push(r.cwd);
     if (r.gitBranch) gitBranch = r.gitBranch;
     if (r.version) version = r.version;
@@ -277,7 +291,7 @@ function parseInternal(
       // notes to itself, injected as a "user" message. Claude Code hides it
       // behind the compact divider; rendering it here put a wall of prompt
       // text in the chat as if the user had typed it.
-      if ((r as { isCompactSummary?: boolean }).isCompactSummary) continue;
+      if ((r as { isCompactSummary?: boolean }).isCompactSummary) return;
       const { text, toolResults, imageBlocks } = flattenUser(r.message.content);
       // Records Claude Code itself flags as machinery (isMeta): a skill's
       // expanded instructions, its own "continue" nudge after a compaction,
@@ -290,7 +304,7 @@ function parseInternal(
         const skill = /^Base directory for this skill:\s*(\S+)/.exec(text.trimStart());
         if (skill) {
           const name = skill[1].replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'skill';
-          pushStep(steps, {
+          pushStep({
             id: stepId(r, seq++),
             ts: r.timestamp ?? null,
             kind: 'marker',
@@ -298,14 +312,14 @@ function parseInternal(
             detail: 'its instructions stay out of the chat',
           });
         }
-        continue;
+        return;
       }
       const images = imageBlocks.length;
       // The bytes stay in the transcript; steps carry an address per image so
       // the client can fetch a thumbnail on demand instead of every snapshot
       // hauling megabytes of base64 around.
       const imageRefs = r.uuid ? imageBlocks.map((b) => ({ id: `${r.uuid}:${b.idx}`, media: b.media })) : undefined;
-      for (const tr of toolResults) resolved.add(tr.id);
+      for (const tr of toolResults) toolUses.delete(tr.id);
       if (text && isInterruptMarker(text)) interrupted = true;
       // Scaling notes can arrive one per image, CONCATENATED into one record
       // — "[Image: …] [Image: …]" — and mixed with real prose. Strip every
@@ -315,7 +329,7 @@ function parseInternal(
       const cleanText = text ? notes.rest : '';
       if ((noteImages > 0 && !cleanText) || (images > 0 && !cleanText)) {
         // Attachments with no prose: the images are the whole turn.
-        pushStep(steps, {
+        pushStep({
           id: stepId(r, seq++),
           ts: r.timestamp ?? null,
           kind: 'user',
@@ -324,7 +338,7 @@ function parseInternal(
           imageDims: notes.dims[0],
           ...(imageRefs?.length ? { imageRefs } : {}),
         });
-        continue;
+        return;
       }
       const invocation = cleanText ? commandInvocation(cleanText) : null;
       const stdout = cleanText && !invocation ? commandStdout(cleanText) : null;
@@ -334,7 +348,7 @@ function parseInternal(
         // persist the command's output, so treating this as "user spoke"
         // left the robot claiming "Thinking…" (and the panel warning about a
         // phantom terminal) for the whole idle window after every /context.
-        pushStep(steps, { id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'user', label: rawText(invocation), truncated: wasCut(invocation) });
+        pushStep({ id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'user', label: rawText(invocation), truncated: wasCut(invocation) });
       } else if (stdout !== null) {
         // What the command printed. Close the turn either way — a command that
         // printed nothing still finished, and leaving lastEvent on 'user' kept
@@ -342,7 +356,7 @@ function parseInternal(
         // A bare "Compacted" is skipped: the compact_boundary marker below
         // says the same thing with the numbers.
         if (stdout && stdout !== 'Compacted')
-          pushStep(steps, { id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'assistant_text', label: rawText(stdout), truncated: wasCut(stdout) });
+          pushStep({ id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'assistant_text', label: rawText(stdout), truncated: wasCut(stdout) });
         lastEvent = 'assistant_text';
         interrupted = false;
       } else if (cleanText && !isMetaText(cleanText)) {
@@ -353,8 +367,8 @@ function parseInternal(
         // (a crash, a kill, a laptop lid) pinned the robot on "working —
         // Running Bash…" for as long as the conversation stayed alive,
         // because every new record refreshed the idle timer.
-        for (const id of toolUses.keys()) resolved.add(id);
-        pushStep(steps, { id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'user', label: rawText(cleanText), truncated: wasCut(cleanText), ...(images + noteImages > 0 ? { images: images + noteImages, imageDims: notes.dims[0] } : {}), ...(imageRefs?.length ? { imageRefs } : {}) });
+        toolUses.clear();
+        pushStep({ id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'user', label: rawText(cleanText), truncated: wasCut(cleanText), ...(images + noteImages > 0 ? { images: images + noteImages, imageDims: notes.dims[0] } : {}), ...(imageRefs?.length ? { imageRefs } : {}) });
         lastEvent = 'user';
         lastSystemError = false; // a new turn clears a previous failure
         interrupted = false; // asking for something new resumes the session
@@ -364,7 +378,7 @@ function parseInternal(
         // read a stack trace was to leave airoom for a terminal. Keyed by
         // toolUseId so the client can fold it into the call it belongs to.
         const body = resultText(toolResults[0].content);
-        pushStep(steps, { id: stepId(r, seq++),
+        pushStep({ id: stepId(r, seq++),
           ts: r.timestamp ?? null,
           kind: 'tool_result',
           label: 'tool result',
@@ -386,12 +400,12 @@ function parseInternal(
         // is the commonest synthetic record there is. Calling it a failure put
         // a permanent red "run failed" in the chat and left the robot flagged
         // "Blocked — needs attention" for a run the user had simply stopped.
-        if (isBenignNotice(errText)) continue;
+        if (isBenignNotice(errText)) return;
         interrupted = false; // a genuine failure, not a clean stop
         lastSystemError = true;
-        pushStep(steps, { id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'system', label: snippet(errText, 100) });
+        pushStep({ id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'system', label: snippet(errText, 100) });
         lastEvent = 'system';
-        continue;
+        return;
       }
       interrupted = false; // the agent spoke again — whatever stopped is over
       messageCount++;
@@ -399,7 +413,7 @@ function parseInternal(
       const content = Array.isArray(r.message.content) ? r.message.content : [];
       for (const b of content) {
         if (b?.type === 'thinking' && b.thinking) {
-          pushStep(steps, { id: stepId(r, seq++),
+          pushStep({ id: stepId(r, seq++),
             ts: r.timestamp ?? null,
             kind: 'thinking',
             label: 'Thinking…',
@@ -407,7 +421,7 @@ function parseInternal(
           });
           lastEvent = 'assistant_tool'; // mid-turn; not a reply to the user yet
         } else if (b?.type === 'text' && b.text?.trim()) {
-          pushStep(steps, { id: stepId(r, seq++),
+          pushStep({ id: stepId(r, seq++),
             ts: r.timestamp ?? null,
             kind: 'assistant_text',
             label: rawText(b.text),
@@ -415,9 +429,9 @@ function parseInternal(
           });
           lastEvent = 'assistant_text';
         } else if (b?.type === 'tool_use') {
-          toolUses.set(b.id, { name: b.name, input: b.input });
           const desc = describeTool(b.name, b.input);
-          pushStep(steps, { id: stepId(r, seq++),
+          toolUses.set(b.id, { name: b.name, label: desc.label });
+          pushStep({ id: stepId(r, seq++),
             ts: r.timestamp ?? null,
             kind: 'tool_use',
             label: desc.label,
@@ -438,15 +452,15 @@ function parseInternal(
         const detail = [pre && post ? `${pre} → ${post} tokens` : null, meta?.trigger === 'auto' ? 'automatic' : null]
           .filter(Boolean)
           .join(' · ');
-        pushStep(steps, { id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'marker', label: 'Conversation compacted', detail: detail || undefined });
-        for (const id of toolUses.keys()) resolved.add(id); // the old turns are a summary now
+        pushStep({ id: stepId(r, seq++), ts: r.timestamp ?? null, kind: 'marker', label: 'Conversation compacted', detail: detail || undefined });
+        toolUses.clear(); // the old turns are a summary now
         if (meta?.trigger !== 'auto') {
           lastEvent = 'assistant_text';
           interrupted = false;
         }
       } else if ((r.hookErrors && r.hookErrors.length) || r.preventedContinuation) {
         lastSystemError = true;
-        pushStep(steps, { id: stepId(r, seq++),
+        pushStep({ id: stepId(r, seq++),
           ts: r.timestamp ?? null,
           kind: 'system',
           label: `system: ${r.subtype ?? 'event'}`,
@@ -454,123 +468,124 @@ function parseInternal(
         lastEvent = 'system';
       }
     }
-  }
-
-  // A file with no main-chain conversation at all — e.g. a subagent
-  // transcript stored top-level, or a session that never got started — is
-  // NOT an agent and must never appear in any room.
-  if (messageCount === 0 && steps.length === 0) return { robot: null, steps };
-
-  // Find a tool_use with no matching result → agent is executing (or awaiting permission).
-  let pending: { name: string; input: any } | null = null;
-  for (const [id, tu] of toolUses) if (!resolved.has(id)) pending = tu;
-
-  const ageMs = lastTs ? Date.now() - Date.parse(lastTs) : Infinity;
-
-  let status: RobotStatus;
-  let currentAction: string;
-
-  if (lastSystemError) {
-    status = 'error';
-    currentAction = 'Blocked — needs attention';
-  } else if (interrupted) {
-    // Stopped on purpose. Checked before `pending`, because interrupting a tool
-    // call leaves its tool_use unresolved and that would otherwise read as work
-    // still in flight.
-    status = 'idle';
-    currentAction = 'Stopped';
-  } else if (pending && INPUT_TOOLS[pending.name]) {
-    // literally blocked on a user decision (question dialog, plan approval)
-    status = 'waiting_input';
-    currentAction = INPUT_TOOLS[pending.name];
-  } else if (pending) {
-    status = 'working';
-    currentAction = `Running ${toolLabel(pending.name, pending.input)}`;
-  } else if (lastEvent === 'assistant_text') {
-    // A completed turn is FINISHED. "Waiting for your reply" is reserved for
-    // states where the user must actually click/decide — never inferred from
-    // the text of a finished answer.
-    status = 'done';
-    currentAction = 'Finished';
-  } else if (lastEvent === 'user') {
-    status = 'working';
-    currentAction = 'Thinking…';
-  } else if (lastEvent === 'assistant_tool' || lastEvent === 'tool_result') {
-    status = 'working';
-    currentAction = 'Working…';
-  } else {
-    status = 'idle';
-    currentAction = 'Idle';
-  }
-
-  // Age overrides: a "working" that stopped emitting is parked; a finished
-  // turn only counts as "your move" briefly — then it's simply done.
-  if (status === 'working' && ageMs > IDLE_MS) {
-    status = 'idle';
-    currentAction = 'Idle';
-  }
-  if (status === 'waiting_input' && ageMs > ATTENTION_MS) {
-    status = 'idle';
-    currentAction = 'Idle · asked you something earlier';
-  }
-  if (status === 'done' && ageMs > ATTENTION_MS) {
-    status = 'idle';
-    currentAction = 'Idle';
-  }
-  if (status === 'error' && ageMs > ATTENTION_MS) {
-    status = 'idle';
-    currentAction = 'Idle · last run failed';
-  }
-
-  const title =
-    customTitle ||
-    aiTitle ||
-    (firstUserText ? snippet(firstUserText, 40) : `session ${sessionId.slice(0, 8)}`);
-
-  // Home project: the cwd whose encoding matches the transcript's project dir
-  // (resume only works there). Claude Code has encoded project dirs both as
-  // slashes→dashes and as all-non-alphanumerics→dashes — accept either.
-  // Fall back to the first cwd the session saw; a session with no cwd at all
-  // is unplaceable and must not invent a room.
-  let home = cwds[0] ?? '';
-  if (projectDirName) {
-    const match = cwds.find(
-      (c) =>
-        c.replaceAll('/', '-') === projectDirName ||
-        c.replace(/[^a-zA-Z0-9]/g, '-') === projectDirName,
-    );
-    if (match) home = match;
-  }
-  if (!home) return { robot: null, steps };
-
-  const robot: Robot = {
-    sessionId,
-    roomId: home,
-    title,
-    status,
-    currentAction,
-    pendingTool: pending?.name,
-    gitBranch,
-    version,
-    lastActivity: lastTs,
-    messageCount,
-    recentSteps: steps.slice(-8),
   };
-  return { robot, steps };
+
+  const robot = (): Robot | null => {
+    // A file with no main-chain conversation at all — e.g. a subagent
+    // transcript stored top-level, or a session that never got started — is
+    // NOT an agent and must never appear in any room.
+    if (messageCount === 0 && steps.length === 0) return null;
+
+    // The newest call still without a result → agent is executing (or awaiting permission).
+    let pending: { name: string; label: string } | null = null;
+    for (const tu of toolUses.values()) pending = tu;
+
+    const ageMs = lastTs ? Date.now() - Date.parse(lastTs) : Infinity;
+
+    let status: RobotStatus;
+    let currentAction: string;
+
+    if (lastSystemError) {
+      status = 'error';
+      currentAction = 'Blocked — needs attention';
+    } else if (interrupted) {
+      // Stopped on purpose. Checked before `pending`, because interrupting a tool
+      // call leaves its tool_use unresolved and that would otherwise read as work
+      // still in flight.
+      status = 'idle';
+      currentAction = 'Stopped';
+    } else if (pending && INPUT_TOOLS[pending.name]) {
+      // literally blocked on a user decision (question dialog, plan approval)
+      status = 'waiting_input';
+      currentAction = INPUT_TOOLS[pending.name];
+    } else if (pending) {
+      status = 'working';
+      currentAction = `Running ${pending.label}`;
+    } else if (lastEvent === 'assistant_text') {
+      // A completed turn is FINISHED. "Waiting for your reply" is reserved for
+      // states where the user must actually click/decide — never inferred from
+      // the text of a finished answer.
+      status = 'done';
+      currentAction = 'Finished';
+    } else if (lastEvent === 'user') {
+      status = 'working';
+      currentAction = 'Thinking…';
+    } else if (lastEvent === 'assistant_tool' || lastEvent === 'tool_result') {
+      status = 'working';
+      currentAction = 'Working…';
+    } else {
+      status = 'idle';
+      currentAction = 'Idle';
+    }
+
+    // Age overrides: a "working" that stopped emitting is parked; a finished
+    // turn only counts as "your move" briefly — then it's simply done.
+    if (status === 'working' && ageMs > IDLE_MS) {
+      status = 'idle';
+      currentAction = 'Idle';
+    }
+    if (status === 'waiting_input' && ageMs > ATTENTION_MS) {
+      status = 'idle';
+      currentAction = 'Idle · asked you something earlier';
+    }
+    if (status === 'done' && ageMs > ATTENTION_MS) {
+      status = 'idle';
+      currentAction = 'Idle';
+    }
+    if (status === 'error' && ageMs > ATTENTION_MS) {
+      status = 'idle';
+      currentAction = 'Idle · last run failed';
+    }
+
+    const title =
+      customTitle ||
+      aiTitle ||
+      (firstUserText ? snippet(firstUserText, 40) : `session ${sessionId.slice(0, 8)}`);
+
+    // Home project: the cwd whose encoding matches the transcript's project dir
+    // (resume only works there). Claude Code has encoded project dirs both as
+    // slashes→dashes and as all-non-alphanumerics→dashes — accept either.
+    // Fall back to the first cwd the session saw; a session with no cwd at all
+    // is unplaceable and must not invent a room.
+    let home = cwds[0] ?? '';
+    if (projectDirName) {
+      const match = cwds.find(
+        (c) =>
+          c.replaceAll('/', '-') === projectDirName ||
+          c.replace(/[^a-zA-Z0-9]/g, '-') === projectDirName,
+      );
+      if (match) home = match;
+    }
+    if (!home) return null;
+
+    return {
+      sessionId,
+      roomId: home,
+      title,
+      status,
+      currentAction,
+      pendingTool: pending?.name,
+      gitBranch,
+      version,
+      lastActivity: lastTs,
+      messageCount,
+      recentSteps: steps.slice(-RECENT_STEPS),
+    };
+  };
+
+  return {
+    add: (record) => {
+      // A line that parsed to something other than an object is not a record.
+      if (record && typeof record === 'object') add(record as Rec);
+    },
+    robot,
+    steps: () => steps,
+  };
 }
 
-/**
- * A window onto a session's steps: the most recent `limit`, plus whether older
- * ones exist before it (so the chat can offer "load older").
- */
-export function parseSteps(raw: string, limit = 40): { steps: Step[]; hasMore: boolean } {
-  return windowSteps(parseAllSteps(raw), limit);
-}
-
-/** Every step in the transcript. Split out so callers that fetch the same file
- *  repeatedly can cache the parse instead of redoing it per request. */
+/** Every step in the transcript. */
 export function parseAllSteps(raw: string): Step[] {
-  return parseInternal(raw, 'x').steps;
+  return parseInternal(raw, 'x').steps();
 }
 
 /** Take the newest `limit` steps, and say whether older ones remain. */

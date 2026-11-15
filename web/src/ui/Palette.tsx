@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { FleetSnapshot, Playbook } from '@shared/types';
+import type { BrowserAgents, FleetSnapshot, Playbook } from '@shared/types';
 import { basename } from '../pathish';
 import { ago } from './Queue';
 
@@ -151,6 +151,10 @@ export function paletteRows(args: {
   newTask: (roomId: string) => void;
   openQueue: () => void;
   openProjects: () => void;
+  /** Present only in the desktop app, where a browser pane can exist. */
+  browser?: { shown: boolean; show: () => void; hide: () => void };
+  /** Where agents browse: airoom's tabs or the user's own Chrome. */
+  agentsBrowse?: { use: BrowserAgents; set: (use: BrowserAgents) => void };
   toggleFocus: () => void;
   toggleSound: () => void;
   playbooks?: Playbook[];
@@ -171,6 +175,22 @@ export function paletteRows(args: {
   }
   rows.push({ key: 'a:queue', group: 'Actions', label: 'Open the Needs-you list', keys: [mod, 'J'], run: args.openQueue });
   rows.push({ key: 'a:projects', group: 'Actions', label: 'Choose which projects appear', run: args.openProjects });
+  if (args.browser) {
+    const b = args.browser;
+    rows.push(
+      b.shown
+        ? { key: 'a:browser', group: 'Actions', label: 'Back to the office', hint: 'the browser keeps its page', run: b.hide }
+        : { key: 'a:browser', group: 'Actions', label: 'Open the browser', hint: 'try your app, or watch an agent test it', run: b.show },
+    );
+  }
+  if (args.agentsBrowse) {
+    const a = args.agentsBrowse;
+    rows.push(
+      a.use === 'chrome'
+        ? { key: 'a:chrome', group: 'Actions', label: "Agents use airoom's browser", hint: 'they use your own Chrome now', run: () => a.set('pane') }
+        : { key: 'a:chrome', group: 'Actions', label: 'Agents use my Chrome', hint: 'your profiles and sign-ins, through Claude in Chrome', run: () => a.set('chrome') },
+    );
+  }
   rows.push({ key: 'a:focus', group: 'Actions', label: args.focusMode ? 'Focus mode off' : 'Focus mode on', hint: 'monochrome office, colour for the agents', run: args.toggleFocus });
   rows.push({ key: 'a:sound', group: 'Actions', label: args.soundOn ? 'Sound off' : 'Sound on', run: args.toggleSound });
   rows.push({

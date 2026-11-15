@@ -99,8 +99,6 @@ export function dirtyFiles(dir: string, tracked = false): number {
   }
 }
 
-export const isDirty = (dir: string) => dirtyFiles(dir) > 0;
-
 /** A repository with no commits cannot have worktrees at all. */
 export function hasCommits(repo: string): boolean {
   try {

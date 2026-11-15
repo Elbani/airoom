@@ -123,18 +123,6 @@ export function pickPathFromShellOutput(out: string, exists: (p: string) => bool
   return ordered.find((l) => exists(l)) ?? null;
 }
 
-/**
- * The runnable file behind an npm shim. `claude.cmd` cannot be spawned
- * without a shell — and a shell plus a prompt as an argument is an injection
- * waiting to happen — but the cli.js it wraps runs fine under node.
- */
-export function npmCliBeside(shim: string, fs: FsLike = realFs): string | null {
-  if (!/\.cmd$/i.test(shim)) return null;
-  const dir = path.win32.dirname(shim);
-  const cli = path.win32.join(dir, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
-  return fs.exists(cli) ? cli : null;
-}
-
 let shellHit: string | null = null;
 let shellProbedAt = 0;
 let shellProbe: Promise<string | null> | null = null;

@@ -43,15 +43,12 @@ export function ollamaEnv(): Record<string, string> {
 export const OLLAMA_APP = '/Applications/Ollama.app';
 export const OLLAMA_BINS = ['/opt/homebrew/bin/ollama', '/usr/local/bin/ollama'];
 
-/** How to bring Ollama up: the app when present (it gives the user a menu-bar
- *  icon to quit it from), else the CLI's own server, else nothing to do. */
-/** Below this window an agent turn does not fit: the compact local prompt
- *  and tools are ~3k, and one file read can be more than that. */
-export const LOCAL_MIN_CONTEXT = 16384;
 /** What airoom starts Ollama with. Ollama's own guidance for Claude Code is
  *  32k or more; its default is 4k. */
 export const LOCAL_START_CONTEXT = 32768;
 
+/** How to bring Ollama up: the app when present (it gives the user a menu-bar
+ *  icon to quit it from), else the CLI's own server, else nothing to do. */
 export function pickOllamaLauncher(
   exists: (p: string) => boolean = existsSync,
   platform: NodeJS.Platform = process.platform,

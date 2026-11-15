@@ -565,7 +565,7 @@ export function computeLayout(snapshot: FleetSnapshot, outerW: number, outerH: n
       if (widths.reduce((a, b) => a + b, 0) > cw) {
         // Take the excess off the widest parts first — the project is the one
         // with room to spare, and a lane squeezed to nothing helps nobody.
-        const spare = raw.map((w, i) => Math.max(0, widths[i] - minW));
+        const spare = raw.map((_, i) => Math.max(0, widths[i] - minW));
         const spareTotal = spare.reduce((a, b) => a + b, 0);
         const over = widths.reduce((a, b) => a + b, 0) - cw;
         widths =

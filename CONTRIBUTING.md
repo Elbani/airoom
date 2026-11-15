@@ -14,6 +14,14 @@ npm run dev             # server on :8787 and the web UI on :5173
 npm run app             # the desktop shell against a fresh web build
 ```
 
+An installed airoom owns port 8787 and the app's single-instance lock. To run
+a development shell beside it, give the copy its own port and profile:
+
+```bash
+npm run build --prefix web
+AIROOM_PORT=8797 npm start --prefix desktop -- --user-data-dir=/tmp/airoom-dev
+```
+
 ## Before you open a pull request
 
 Run the three gates the Windows workflow runs, and make sure each exits 0:

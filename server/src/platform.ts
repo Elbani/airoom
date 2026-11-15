@@ -13,7 +13,6 @@
  * tests for this file run on both platforms with the same expectations.
  */
 import { existsSync } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 export const isWindows = process.platform === 'win32';
@@ -72,8 +71,4 @@ export function listRoots(exists: (p: string) => boolean = existsSync): string[]
     if (exists(d)) roots.push(d);
   }
   return roots.length ? roots : ['C:\\'];
-}
-
-export function homeDir(): string {
-  return os.homedir();
 }

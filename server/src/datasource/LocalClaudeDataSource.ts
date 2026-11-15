@@ -1,10 +1,10 @@
-import { promises as fs } from 'node:fs';
+import { createReadStream, promises as fs, type Stats } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import chokidar, { type FSWatcher } from 'chokidar';
 import type { DataSource } from './DataSource';
 import type { AwayAgent, FleetSnapshot, Room, Robot, Step } from '../../../shared/types';
-import { parseAllSteps, parseSession, windowSteps } from '../parse/sessionParser';
+import { createSessionParse, MAX_STEPS, RECENT_STEPS, windowSteps, type SessionParse } from '../parse/sessionParser';
 
 import { basename, isAbsolutePath, normalizePath, segments } from '../platform';
 /**
@@ -14,12 +14,70 @@ import { basename, isAbsolutePath, normalizePath, segments } from '../platform';
  */
 const ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
+/** A session written to within this window stays open: only what it appends is read. */
+const LIVE_WINDOW_MS = 48 * 60 * 60 * 1000;
+/** How many bytes are compared to decide that a file only grew. */
+const ANCHOR_BYTES = 256;
+/** Open chats whose every step is kept. */
+const OPEN_CHATS = 3;
+
+/** A parse kept open: how far into the file it got, and what the file looked like there. */
+interface LiveParse {
+  parse: SessionParse;
+  /** Bytes consumed: everything before this is in `parse`. Always just past a whole line. */
+  offset: number;
+  ino: number;
+  /** The file's first bytes and the bytes just before `offset`, as they were when read. */
+  head: Buffer;
+  anchor: Buffer;
+}
+
 interface CacheEntry {
   size: number;
   mtimeMs: number;
   // null = parsed and determined NOT to be an agent (e.g. a sidechain/subagent
   // transcript) — cached so large skipped files aren't re-parsed every snapshot
   robot: Robot | null;
+  live?: LiveParse;
+}
+
+/**
+ * Hand a file's lines to `onLine`, from byte `from` on, one line in memory at
+ * a time. Returns the offset just past the last line that ended in a newline,
+ * and whatever followed it (a line still being written, or a last line that
+ * never got its newline). `onLine` returning false stops the read.
+ */
+async function eachLine(
+  file: string,
+  from: number,
+  onLine: (line: Buffer) => boolean | void,
+): Promise<{ offset: number; tail: Buffer }> {
+  let offset = from;
+  let carry: Buffer[] = [];
+  let carried = 0;
+  const stream = createReadStream(file, { start: from, highWaterMark: 1 << 20 });
+  try {
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      let at = 0;
+      for (let nl = chunk.indexOf(10, at); nl !== -1; nl = chunk.indexOf(10, at)) {
+        const piece = chunk.subarray(at, nl);
+        const line = carried ? Buffer.concat([...carry, piece], carried + piece.length) : piece;
+        carry = [];
+        carried = 0;
+        offset += line.length + 1;
+        at = nl + 1;
+        if (line.length && onLine(line) === false) return { offset, tail: Buffer.alloc(0) };
+      }
+      if (at < chunk.length) {
+        const rest = chunk.subarray(at);
+        carry.push(rest);
+        carried += rest.length;
+      }
+    }
+  } finally {
+    stream.destroy();
+  }
+  return { offset, tail: carried ? Buffer.concat(carry, carried) : Buffer.alloc(0) };
 }
 
 /**
@@ -28,9 +86,11 @@ interface CacheEntry {
  * (Subagent transcripts live in <encoded-project>/<sessionId>/subagents/ —
  * deliberately NOT scanned: they are sidechains of a session, not sessions.)
  *
- * Perf: session files can be tens of MB, so parses are cached per file keyed
- * on (size, mtime). Compaction can REWRITE a file in place — size/mtime change
- * covers that too (never assume append-only).
+ * Perf: session files reach hundreds of MB, and the busiest one is appended to
+ * every few seconds. Files are streamed a line at a time, never held whole; a
+ * session still being written keeps its parse open, so only what it appends
+ * is read. Compaction can rewrite a file in place, so "it only grew" is
+ * checked, never assumed.
  */
 export class LocalClaudeDataSource implements DataSource {
   private root: string;
@@ -38,8 +98,12 @@ export class LocalClaudeDataSource implements DataSource {
   private listeners = new Set<() => void>();
   private debounceTimer: NodeJS.Timeout | null = null;
   private cache = new Map<string, CacheEntry>();
-  // Parsed transcript steps, keyed by file — see getTranscript.
-  private stepCache = new Map<string, { size: number; mtimeMs: number; steps: Step[] }>();
+  /** The few chats open in the UI, every step kept, least recent first. */
+  private chats = new Map<string, { size: number; mtimeMs: number; live: LiveParse }>();
+  /** Reads under way: asked twice at once, a file is still read once. */
+  private reading = new Map<string, Promise<unknown>>();
+  /** How much reading the transcripts has cost. For tests and for /health. */
+  private readStats = { bytes: 0, fullReads: 0, appends: 0 };
   // Manually registered project dirs (rooms that may not have sessions yet).
   private configPath: string;
   private registered: string[] | null = null; // lazy-loaded
@@ -209,7 +273,7 @@ export class LocalClaudeDataSource implements DataSource {
     if (at !== -1) list.splice(at, 1);
     await this.persist();
     this.cache.delete(match);
-    this.stepCache.delete(match);
+    this.chats.delete(match);
     this.notify();
     return { movedTo: dest };
   }
@@ -258,32 +322,103 @@ export class LocalClaudeDataSource implements DataSource {
     return files;
   }
 
-  /** Parse one session file, reusing the cached result if it hasn't changed. */
-  private async robotFor(file: string): Promise<Robot | null> {
-    let stat;
+  /** What reading transcripts has cost since this process started. */
+  stats(): { bytes: number; fullReads: number; appends: number } {
+    return { ...this.readStats };
+  }
+
+  /** Stream `file` from `from` into `parse`. Returns how far it got: always just past a whole record. */
+  private async feed(parse: SessionParse, file: string, from: number): Promise<number> {
+    const take = (line: Buffer) => {
+      try {
+        parse.add(JSON.parse(line.toString('utf8')));
+      } catch {
+        /* a line that is not JSON is skipped, as it always was */
+      }
+    };
+    const { offset, tail } = await eachLine(file, from, take);
+    this.readStats.bytes += offset - from;
+    if (!tail.length) return offset;
+    // No newline after the last line. If it is whole JSON it is a record like
+    // any other; if not, the writer is mid-line and it waits for next time.
     try {
-      stat = await fs.stat(file);
+      parse.add(JSON.parse(tail.toString('utf8')));
     } catch {
-      return null;
+      return offset;
     }
-    const cached = this.cache.get(file);
-    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-      return cached.robot;
-    }
-    let raw: string;
+    this.readStats.bytes += tail.length;
+    return offset + tail.length;
+  }
+
+  /** The file's first bytes and the bytes just before `offset`: what "it only grew" is checked against. */
+  private async ends(file: string, offset: number): Promise<{ head: Buffer; anchor: Buffer }> {
+    const n = Math.min(ANCHOR_BYTES, offset);
+    const head = Buffer.alloc(n);
+    const anchor = Buffer.alloc(n);
+    const fh = await fs.open(file, 'r');
     try {
-      raw = await fs.readFile(file, 'utf8');
-    } catch {
-      return null;
+      await fh.read(head, 0, n, 0);
+      await fh.read(anchor, 0, n, offset - n);
+    } finally {
+      await fh.close();
     }
-    if (!raw.trim()) return null;
-    try {
-      const robot = parseSession(raw, path.basename(file, '.jsonl'), path.basename(path.dirname(file)));
-      this.cache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, robot });
-      return robot;
-    } catch {
-      return null;
+    return { head, anchor };
+  }
+
+  /**
+   * Bring a parse of `file` up to date: only the appended bytes when the file
+   * only grew (same file, same first bytes, same bytes before where reading
+   * stopped), from the top otherwise. `track` keeps what the next check needs.
+   */
+  private async catchUp(file: string, stat: Stats, live: LiveParse | undefined, keep: number, track: boolean): Promise<LiveParse> {
+    if (live && (stat.ino !== live.ino || stat.size < live.offset)) live = undefined;
+    if (live) {
+      const now = await this.ends(file, live.offset);
+      if (!now.head.equals(live.head) || !now.anchor.equals(live.anchor)) live = undefined;
     }
+    if (live) this.readStats.appends++;
+    else {
+      this.readStats.fullReads++;
+      const parse = createSessionParse(path.basename(file, '.jsonl'), path.basename(path.dirname(file)), keep);
+      live = { parse, offset: 0, ino: stat.ino, head: Buffer.alloc(0), anchor: Buffer.alloc(0) };
+    }
+    live.offset = await this.feed(live.parse, file, live.offset);
+    if (track) Object.assign(live, await this.ends(file, live.offset));
+    return live;
+  }
+
+  /** Run `read` once per key at a time: a second caller shares the first one's result. */
+  private once<T>(key: string, read: () => Promise<T>): Promise<T> {
+    const running = this.reading.get(key) as Promise<T> | undefined;
+    if (running) return running;
+    const p = read().finally(() => this.reading.delete(key));
+    this.reading.set(key, p);
+    return p;
+  }
+
+  /** Parse one session file for its desk, reusing the cached result if it hasn't changed. */
+  private robotFor(file: string): Promise<Robot | null> {
+    return this.once(`desk ${file}`, async () => {
+      let stat;
+      try {
+        stat = await fs.stat(file);
+      } catch {
+        return null;
+      }
+      const cached = this.cache.get(file);
+      if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.robot;
+      try {
+        // Only a session someone is still writing to is worth keeping open,
+        // and a desk needs no more than its last few steps.
+        const open = Date.now() - stat.mtimeMs < LIVE_WINDOW_MS;
+        const live = await this.catchUp(file, stat, cached?.live, RECENT_STEPS, open);
+        const robot = live.parse.robot();
+        this.cache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, robot, ...(open ? { live } : {}) });
+        return robot;
+      } catch {
+        return null;
+      }
+    });
   }
 
   async getSnapshot(): Promise<FleetSnapshot> {
@@ -425,20 +560,26 @@ export class LocalClaudeDataSource implements DataSource {
     const files = await this.listSessionFiles();
     const file = files.find((f) => path.basename(f, '.jsonl') === sessionId);
     if (!file) return null;
-    const raw = await fs.readFile(file, 'utf8');
-    for (const line of raw.split('\n')) {
-      if (!line.includes(uuid)) continue;
+    // One line at a time, and no further than the record: the image may be in
+    // a transcript of several hundred megabytes.
+    const needle = Buffer.from(uuid);
+    let found: { media: string; data: Buffer } | null = null;
+    const look = (line: Buffer): boolean | void => {
+      if (!line.includes(needle)) return;
       try {
-        const rec = JSON.parse(line);
-        if (rec.uuid !== uuid) continue;
+        const rec = JSON.parse(line.toString('utf8'));
+        if (rec.uuid !== uuid) return;
         const block = rec.message?.content?.[idx];
-        if (block?.type !== 'image' || block.source?.type !== 'base64' || typeof block.source.data !== 'string') return null;
-        return { media: String(block.source.media_type ?? 'image/png'), data: Buffer.from(block.source.data, 'base64') };
+        if (block?.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string')
+          found = { media: String(block.source.media_type ?? 'image/png'), data: Buffer.from(block.source.data, 'base64') };
+        return false; // this was the record, image or not
       } catch {
         /* torn line */
       }
-    }
-    return null;
+    };
+    const { tail } = await eachLine(file, 0, look);
+    if (!found && tail.length) look(tail);
+    return found;
   }
 
   async getTranscript(sessionId: string, limit = 40): Promise<{ steps: Step[]; hasMore: boolean }> {
@@ -446,24 +587,18 @@ export class LocalClaudeDataSource implements DataSource {
     const match = files.find((f) => path.basename(f, '.jsonl') === sessionId);
     if (!match) return { steps: [], hasMore: false };
     try {
-      // The open panel re-subscribes on every change to its session, and each
-      // fetch used to re-read and re-walk the entire JSONL — the same work the
-      // snapshot's robot parse had just done, on a file that can be tens of MB.
-      // Cache the parsed steps on (size, mtime) like the robot cache does, and
-      // serve the window from memory. Compaction rewrites in place, which the
-      // mtime/size pair catches.
-      const stat = await fs.stat(match);
-      const hit = this.stepCache.get(match);
-      if (hit && hit.size === stat.size && hit.mtimeMs === stat.mtimeMs)
-        return windowSteps(hit.steps, limit);
-
-      const raw = await fs.readFile(match, 'utf8');
-      const steps = parseAllSteps(raw);
-      // Only the session you have open is fetched repeatedly, so a couple of
-      // entries capture the whole benefit — keep it small rather than holding
-      // every transcript ever opened in memory.
-      if (this.stepCache.size >= 3) this.stepCache.delete(this.stepCache.keys().next().value as string);
-      this.stepCache.set(match, { size: stat.size, mtimeMs: stat.mtimeMs, steps });
+      // The open chat asks again on every change to its session: keep its
+      // parse, every step of it, and catch up on what was appended.
+      const steps = await this.once(`chat ${match}`, async () => {
+        const stat = await fs.stat(match);
+        let hit = this.chats.get(match);
+        this.chats.delete(match); // most recent last
+        if (!hit || hit.size !== stat.size || hit.mtimeMs !== stat.mtimeMs)
+          hit = { size: stat.size, mtimeMs: stat.mtimeMs, live: await this.catchUp(match, stat, hit?.live, MAX_STEPS, true) };
+        this.chats.set(match, hit);
+        if (this.chats.size > OPEN_CHATS) this.chats.delete(this.chats.keys().next().value as string);
+        return hit.live.parse.steps();
+      });
       return windowSteps(steps, limit);
     } catch {
       return { steps: [], hasMore: false };

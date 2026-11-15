@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useFocusTrap } from './useFocusTrap';
 import type { AwayAgent, Robot, RobotStatus } from '@shared/types';
 import { STATUS_COLOR } from '../render/draw';
+import { relTime } from './Queue';
 
 interface Props {
   roomName: string;
@@ -21,17 +22,6 @@ const STATE_LABEL: Record<RobotStatus, string> = {
   error: 'error',
   done: 'done',
 };
-
-function relTime(iso: string | null): string {
-  if (!iso) return '';
-  const s = Math.round((Date.now() - Date.parse(iso)) / 1000);
-  if (Number.isNaN(s)) return '';
-  if (s < 60) return `${s}s ago`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
-}
 
 /**
  * Every session in a room, including the ones with no desk.

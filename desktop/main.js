@@ -5,6 +5,10 @@
 // and (3) connects to the SAME WebSocket protocol as any other client to power
 // the menu-bar badge and native notifications. No IPC, no special casing —
 // the desktop shell is just another airoom client.
+//
+// One thing only the shell can offer rides that same socket: the browser pane
+// (browser.js). The server relays agents' browser commands down it and the
+// shell answers on it, so the pane needs no port of its own.
 const { app, BrowserWindow, Tray, Menu, Notification, nativeImage, shell, dialog, ipcMain } = require('electron');
 const { spawn } = require('node:child_process');
 const { existsSync } = require('node:fs');
@@ -12,8 +16,11 @@ const os = require('node:os');
 const net = require('node:net');
 const path = require('node:path');
 const WebSocket = require('ws');
+const { createBrowserPane } = require('./browser');
 
-const DEFAULT_PORT = 8787;
+// AIROOM_PORT lets a development copy run beside the installed app, which
+// owns 8787; without it the shell would simply attach to that one.
+const DEFAULT_PORT = Number(process.env.AIROOM_PORT) || 8787;
 
 /** Same absolute-path search the server uses — a GUI app has no useful PATH. */
 function claudeBin() {
@@ -50,6 +57,18 @@ let ws = null;
 let wsRetry = 0;
 const lastAttn = new Map(); // sessionId -> boolean, for notification edges
 let booted = false; // suppress notifications for pre-existing state on launch
+
+/** Tell the server what the browser pane looks like right now. */
+function reportPane() {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ v: 1, type: 'browserHost', state: pane.state() }));
+}
+const pane = createBrowserPane({
+  getWindow: () => (win && !win.isDestroyed() ? win : null),
+  notify: (event) => {
+    if (win && !win.isDestroyed()) win.webContents.send('airoom:browser-event', event);
+  },
+  report: reportPane,
+});
 
 /** Is an airoom server (specifically) answering on this port? */
 async function airoomAt(p) {
@@ -154,15 +173,23 @@ function createWindow() {
     title: 'airoom',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
+      // The browser pane is a <webview>. What it may be is decided in
+      // browser.js (pane.secure), not by the page that asks for it.
+      webviewTag: true,
     },
   });
+  pane.secure(win);
   win.loadURL(serverUrl());
   // external links (if any ever appear) go to the real browser
   win.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
     return { action: 'deny' };
   });
-  win.on('closed', () => (win = null));
+  win.on('closed', () => {
+    win = null;
+    reportPane(); // no window, no pane
+  });
+  reportPane();
 }
 
 function showWindow() {
@@ -233,13 +260,27 @@ function notifyAttention(snapshot) {
 
 function connectFleet() {
   ws = new WebSocket(`ws://127.0.0.1:${port}`);
-  ws.on('open', () => (wsRetry = 0));
+  ws.on('open', () => {
+    wsRetry = 0;
+    reportPane(); // announces this shell as the pane's host
+  });
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
       if (msg.type === 'snapshot') {
         updateTray(msg.snapshot);
         notifyAttention(msg.snapshot);
+      } else if (msg.type === 'browserCmd') {
+        // An agent's browser tool call. Always answered, success or not:
+        // the agent's turn is waiting on it.
+        const socket = ws;
+        const answer = (body) => {
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ v: 1, type: 'browserResult', id: msg.id, ...body }));
+        };
+        pane.execute(msg).then(
+          (result) => answer({ ok: true, result }),
+          (err) => answer({ ok: false, error: err && err.message ? err.message : String(err) }),
+        );
       }
     } catch {
       /* ignore */

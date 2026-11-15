@@ -25,6 +25,8 @@ import { Palette, paletteRows } from './ui/Palette';
 import { platform as hostPlatform } from './platform';
 import { ProjectChooser } from './ui/ProjectChooser';
 import { PickerMenu } from './ui/PickerMenu';
+import { BrowserPane, type BrowserProfileRequest, type BrowserProfilesAnswer, type BrowserShellEvent, type BrowserTabsReport } from './ui/BrowserPane';
+import { defaultAgentName } from './names';
 import { thisMachine, tokenPath, yourMachine } from './platform';
 
 /** Anthropic's own command, verbatim. The old approach piped it through a
@@ -36,7 +38,7 @@ const CONNECT_CMD = 'claude setup-token';
 
 // Bumped on UI changes — visible in the footer so "which build am I looking
 // at?" is never a mystery again.
-export const UI_BUILD = 'ui-38';
+export const UI_BUILD = 'ui-43';
 
 declare global {
   interface Window {
@@ -49,6 +51,14 @@ declare global {
         cwd: string,
         sessionId?: string,
       ): Promise<{ ok: boolean; cmd?: string; error?: string }>;
+      /** The browser pane's line to the shell. Present only where a pane can exist. */
+      browser?: {
+        onEvent(listener: (event: BrowserShellEvent) => void): () => void;
+        /** Profiles, as in Chrome. */
+        profiles(request: BrowserProfileRequest): Promise<BrowserProfilesAnswer>;
+        /** Which tab is which page. */
+        tabs(report: BrowserTabsReport): Promise<boolean>;
+      };
     };
   }
 }
@@ -152,6 +162,9 @@ export default function App() {
     addPlaybookRule,
     dropPlaybookRule,
     stopPlaybookRun,
+    browserAgents,
+    chromeCheck,
+    setBrowserAgents,
   } = useFleet();
   // sessionId of a robot, or `spawn:<roomId>` for a ghost desk
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -366,23 +379,101 @@ export default function App() {
    *  Needs-you list. Both stay out of text fields' way: a field that wants
    *  those keys keeps them by stopping the event. */
   const [paletteOpen, setPaletteOpen] = useState(false);
+  /** ⌘K or ⌘J, from this window or from a page in the browser pane. */
+  const appKey = (key: string) => {
+    if (key === 'k') setPaletteOpen((v) => !v);
+    else if (key === 'j') openQueue('needs');
+  };
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = hostPlatform === 'darwin' ? e.metaKey : e.ctrlKey;
-      if (!mod || e.altKey) return;
-      if (e.key === 'k' || e.key === 'K') {
-        e.preventDefault();
-        setPaletteOpen((v) => !v);
-      } else if (e.key === 'j' || e.key === 'J') {
-        e.preventDefault();
-        openQueue('needs');
-      }
+      const key = e.key.toLowerCase();
+      if (!mod || e.altKey || (key !== 'k' && key !== 'j')) return;
+      e.preventDefault();
+      appKey(key);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-    // openQueue closes over setters only; a stale copy behaves the same.
+    // appKey closes over setters only; a stale copy behaves the same.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ---- the browser pane (desktop app only) ----
+  /** The shell's browser, where there is one. Decides whether the rail offers it. */
+  const browserBridge = window.airoomNative?.browser;
+  const canBrowse = !!browserBridge;
+  /** What the stage shows: the office, or the browser in its place. */
+  const [stageView, setStageView] = useState<'office' | 'browser'>('office');
+  /** Mounted on first use and kept: a <webview> loses its page when it unmounts. */
+  const [browserOn, setBrowserOn] = useState(false);
+  /** The agent acting on a page, and in which tab, until it has been quiet for a while. */
+  const [browserDriver, setBrowserDriver] = useState<{ sessionId: string | null; tab: string } | null>(null);
+  /** Bring this tab to the front: the agent you are watching is working in it. */
+  const [browserFocus, setBrowserFocus] = useState<{ tab: string; seq: number } | null>(null);
+  /** An agent used the browser while the office was showing. */
+  const [browserUnseen, setBrowserUnseen] = useState(false);
+  const stageViewRef = useRef(stageView);
+  stageViewRef.current = stageView;
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+  const showBrowser = () => {
+    setBrowserOn(true);
+    setStageView('browser');
+    setBrowserUnseen(false);
+  };
+  useEffect(() => {
+    if (!browserBridge) return;
+    let quiet: ReturnType<typeof setTimeout> | undefined;
+    let lastRun = '';
+    let lastAt = 0;
+    const stop = browserBridge.onEvent((event) => {
+      // airoom's own keys, pressed while the caret was inside a page.
+      if (event.type === 'shortcut') return appKey(event.key);
+      // Tabs are the pane's own business (it listens for them itself).
+      if (event.type !== 'open' && event.type !== 'driver') return;
+      // Either way an agent wants the pane: make sure it exists.
+      setBrowserOn(true);
+      const d = event.driver;
+      if (!d) return;
+      const tab = event.type === 'driver' ? event.tab : undefined;
+      if (tab) {
+        // Every action of an agent comes through here; the app redraws only when who or where changed.
+        setBrowserDriver((prev) => (prev?.sessionId === d.sessionId && prev.tab === tab ? prev : { sessionId: d.sessionId, tab }));
+        clearTimeout(quiet);
+        quiet = setTimeout(() => setBrowserDriver(null), 8000);
+      }
+      // The page comes to the stage only when you are already with that agent
+      // and it has just started. Otherwise the office stays and the rail
+      // lights up. Going back to the office on purpose is respected: the same
+      // agent carrying on does not drag you to the browser again.
+      const fresh = d.runKey !== lastRun || Date.now() - lastAt > 60_000;
+      lastRun = d.runKey;
+      lastAt = Date.now();
+      const watching = selectedIdRef.current;
+      const watched = !!watching && (watching === d.sessionId || watching === `spawn:${d.roomId}`);
+      // With you at that agent's desk, its tab is the one worth looking at,
+      // once: a tab you pick yourself afterwards stays picked.
+      if (watched && tab) setBrowserFocus((prev) => (prev?.tab === tab ? prev : { tab, seq: (prev?.seq ?? 0) + 1 }));
+      if (stageViewRef.current === 'browser') return;
+      if (fresh && watched) {
+        setStageView('browser');
+        setBrowserUnseen(false);
+      } else setBrowserUnseen(true);
+    });
+    return () => {
+      stop();
+      clearTimeout(quiet);
+    };
+    // appKey closes over setters only; a stale copy behaves the same.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const driving = useMemo(() => {
+    if (!browserDriver) return null;
+    const id = browserDriver.sessionId;
+    const name = (id && snapshot?.robots.find((r) => r.sessionId === id)?.name) || (id ? defaultAgentName(id) : 'An agent');
+    return { name, tab: browserDriver.tab };
+  }, [browserDriver, snapshot]);
+
   const openTeam = useMemo(
     () => snapshot?.teams.find((t) => t.id === teamOpenId) ?? null,
     [snapshot, teamOpenId],
@@ -708,9 +799,25 @@ export default function App() {
       </header>
       <div className="body">
         <nav className="rail" aria-label="Places">
-          <button className="rail__i rail__i--on" title="The office" aria-label="The office">
+          <button
+            className={`rail__i ${stageView === 'office' ? 'rail__i--on' : ''}`}
+            title="The office"
+            aria-label="The office"
+            onClick={() => setStageView('office')}
+          >
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11 12 3l9 8" /><path d="M5 10v10h14V10" /><path d="M10 20v-6h4v6" /></svg>
           </button>
+          {canBrowse && (
+            <button
+              className={`rail__i ${stageView === 'browser' ? 'rail__i--on' : ''}`}
+              title={browserUnseen ? 'Browser: an agent is using it' : 'Browser: try your app here, or let an agent test it'}
+              aria-label="Browser"
+              onClick={() => (stageView === 'browser' ? setStageView('office') : showBrowser())}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M3 12h18" /><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18" /></svg>
+              {browserUnseen && stageView !== 'browser' && <span className="rail__live" />}
+            </button>
+          )}
           <button className={`rail__i ${queue === 'needs' ? 'rail__i--on' : ''}`} title="Needs you" aria-label="Needs you" onClick={() => openQueue('needs')}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h5l2 3h2l2-3h5" /><path d="M4 12v6h16v-6" /><path d="M6 12 8 5h8l2 7" /></svg>
             {needsN > 0 && <span className="rail__badge">{needsN}</span>}
@@ -753,6 +860,16 @@ export default function App() {
         <div className="main">
 
       <main className="stage">
+        {browserOn && browserBridge && (
+          <BrowserPane
+            bridge={browserBridge}
+            shown={stageView === 'browser'}
+            driving={driving}
+            focusTab={browserFocus}
+            agents={browserAgents ? { use: browserAgents, status: browserAgents === 'chrome' ? chromeCheck : null, set: setBrowserAgents } : null}
+            onClose={() => setStageView('office')}
+          />
+        )}
         {snapshot ? (
           <PixelWorld
             snapshot={snapshot}
@@ -1139,8 +1256,10 @@ export default function App() {
       </main>
 
       <footer className="hint">
-        click a desk to open it beside the office · an empty desk adds an agent or a team · double-click a room to retheme ·
-        esc closes · {UI_BUILD}
+        {stageView === 'browser'
+          ? 'the page keeps running when you go back to the office · your agents can open, click and read it too · '
+          : 'click a desk to open it beside the office · an empty desk adds an agent or a team · double-click a room to retheme · esc closes · '}
+        {UI_BUILD}
       </footer>
         </div>
 
@@ -1375,6 +1494,8 @@ export default function App() {
             },
             openQueue: () => openQueue('needs'),
             openProjects: () => setChooserOpen(true),
+            browser: canBrowse ? { shown: stageView === 'browser', show: () => showBrowser(), hide: () => setStageView('office') } : undefined,
+            agentsBrowse: browserAgents ? { use: browserAgents, set: setBrowserAgents } : undefined,
             playbooks,
             openPlaybook: (id) => openPlaybooks(id),
             toggleFocus,

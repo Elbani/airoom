@@ -25,12 +25,80 @@ function str(v: unknown): string {
   return typeof v === 'string' ? v : v == null ? '' : String(v);
 }
 
+/** airoom's own browser tabs, as an in-process MCP server. */
+export const BROWSER_MCP = 'airoom-browser';
+export const BROWSER_TOOL_PREFIX = `mcp__${BROWSER_MCP}__`;
+/** Claude Code's Claude in Chrome: the user's own Chrome. */
+export const CHROME_MCP = 'claude-in-chrome';
+export const CHROME_TOOL_PREFIX = `mcp__${CHROME_MCP}__`;
+
+/** "mcp__claude-in-chrome__navigate" + {url} → "open https://…". What is typed stays out. */
+function describeChrome(action: string, inp: Record<string, unknown>): string {
+  if (action === 'navigate') return `open ${str(inp.url)}`;
+  if (action === 'computer') {
+    const a = str(inp.action);
+    if (a === 'type') return 'type text';
+    if (a === 'key') return `press ${str(inp.text)}`;
+    if (a === 'screenshot') return 'take a screenshot';
+    if (a === 'scroll' || a === 'scroll_to') return 'scroll';
+    if (/click/.test(a)) return a.replace(/_/g, ' ');
+    return a ? a.replace(/_/g, ' ') : 'act on the page';
+  }
+  if (action === 'find') return `find ${str(inp.query)}`;
+  if (action === 'form_input') return 'fill in a form field';
+  if (action === 'read_page') return 'read the page';
+  if (action === 'get_page_text') return 'read the page text';
+  if (action === 'javascript_tool') return 'run JavaScript in the page';
+  if (action === 'tabs_context_mcp') return 'look at its tabs';
+  if (action === 'tabs_create_mcp') return 'open a tab';
+  if (action === 'tabs_close_mcp') return 'close a tab';
+  if (action === 'read_console_messages') return 'read the console';
+  if (action === 'read_network_requests') return 'read the network requests';
+  if (action === 'list_connected_browsers') return 'list the connected browsers';
+  if (action === 'select_browser' || action === 'switch_browser') return 'choose a browser';
+  if (action === 'browser_batch') return 'take several steps';
+  if (action === 'gif_creator') return 'record a GIF';
+  if (action === 'resize_window') return 'resize the window';
+  if (action === 'upload_image' || action === 'file_upload') return 'upload a file';
+  return action.replace(/_/g, ' ');
+}
+
+/** "mcp__airoom-browser__click" + {element: 'Save'} → "click Save". */
+function describeBrowser(action: string, inp: Record<string, unknown>): string {
+  const what = str(inp.element) || str(inp.ref);
+  if (action === 'navigate') return `open ${str(inp.url)}`;
+  if (action === 'click') return `${inp.double ? 'double-click' : 'click'} ${what}`.trim();
+  if (action === 'type') return `type into ${what}`.trim();
+  if (action === 'select') return `choose ${str(inp.value)} in ${what}`.trim();
+  if (action === 'press') return `press ${str(inp.key)}`;
+  if (action === 'scroll') return what ? `scroll to ${what}` : `scroll ${str(inp.direction) || 'down'}`;
+  if (action === 'wait') return inp.text ? `wait for "${str(inp.text)}"` : inp.gone ? `wait for "${str(inp.gone)}" to go` : 'wait';
+  if (action === 'evaluate') return `run ${str(inp.expression).replace(/\s+/g, ' ')}`;
+  if (action === 'snapshot') return 'read the page';
+  if (action === 'screenshot') return 'take a screenshot';
+  if (action === 'console') return 'read the console';
+  if (action === 'tabs') {
+    const t = inp.tab != null ? ` ${str(inp.tab)}` : '';
+    if (inp.do === 'new') return inp.url ? `open a new tab at ${str(inp.url)}` : 'open a new tab';
+    if (inp.do === 'select') return `switch to tab${t}`;
+    if (inp.do === 'close') return `close tab${t}`.trim();
+    return 'list the tabs';
+  }
+  return action;
+}
+
 export function describeTool(name: string, input: unknown): ToolDescription {
   const inp = (input ?? {}) as Record<string, unknown>;
+  let shown = name;
   let target = '';
 
-
-  if (name === 'Bash') target = str(inp.command).replace(/\s*\n\s*/g, ' ').trim();
+  if (name.startsWith(CHROME_TOOL_PREFIX)) {
+    shown = 'Chrome';
+    target = describeChrome(name.slice(CHROME_TOOL_PREFIX.length), inp);
+  } else if (name.startsWith(BROWSER_TOOL_PREFIX)) {
+    shown = 'Browser';
+    target = describeBrowser(name.slice(BROWSER_TOOL_PREFIX.length), inp);
+  } else if (name === 'Bash') target = str(inp.command).replace(/\s*\n\s*/g, ' ').trim();
   else if (FILE_TOOLS.has(name)) target = str(inp.file_path || inp.notebook_path);
   else if (name === 'Grep') target = str(inp.pattern);
   else if (name === 'Glob') target = str(inp.pattern);
@@ -51,10 +119,5 @@ export function describeTool(name: string, input: unknown): ToolDescription {
   // pasted heredoc command can be tens of kilobytes. 400 is far more than any
   // row renders, so the client still truncates purely visually.
   if (target.length > 400) target = `${target.slice(0, 399)}…`;
-  return { name, target, label: target ? `${name}: ${target}` : name };
-}
-
-/** Flat label — for the robot's `currentAction` and other one-line surfaces. */
-export function toolLabel(name: string, input: unknown): string {
-  return describeTool(name, input).label;
+  return { name: shown, target, label: target ? `${shown}: ${target}` : shown };
 }

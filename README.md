@@ -16,8 +16,9 @@ agent is doing and answer it without leaving the app.
 Everything stays on your machine. airoom reads the transcripts Claude Code
 already writes to `~/.claude/projects`, drives agents through the Claude Agent
 SDK with your own login, and binds to 127.0.0.1 only. It sends no telemetry.
-Apart from Claude's own traffic to Anthropic, its only outbound request is a
-version check against `airoom.dev/release.json`.
+Apart from Claude's own traffic to Anthropic, and the pages you or your agents
+open in the browser pane, its only outbound request is a version check against
+`airoom.dev/release.json`.
 
 ## Get it
 
@@ -46,6 +47,14 @@ in. It drives the `claude` on your machine, on your account and your limits.
   call pauses with the exact command and Allow / Deny buttons; undecided
   requests deny themselves after ten minutes. Bypass is per run, for
   repositories you trust the agent in.
+- **A browser in the office.** The desktop app has a browser pane where the
+  office usually is, laid out like Chrome, with tabs. Open the app you are
+  building and try it there, or ask an agent to: it opens the page in a tab
+  of its own, clicks, types and reads the result while you watch, with its
+  chat beside it. Profiles work as they do in Chrome, so the same page can be
+  seen as an admin, as a customer or signed out. Or switch agents to your own
+  Chrome, with your real profiles and sign-ins. Pages on your machine open
+  freely; any other site asks you first.
 - **Hire.** An empty desk in any room starts a brand-new session with your
   first message. Hire a whole team with three questions (the goal, where they
   work, when they check in): a lead and a crew that work tasks in parallel,
@@ -68,9 +77,8 @@ npm run app              # the desktop shell against a fresh web build
 ```
 
 `npm run dist:unsigned` packages a macOS app for your own machine. The signed
-release path is in [PACKAGING.md](PACKAGING.md), the Windows build in
-[WINDOWS.md](WINDOWS.md) and the route to a signed Windows installer in
-[WINDOWS-SIGNING.md](WINDOWS-SIGNING.md).
+release path is in [PACKAGING.md](PACKAGING.md), and the Windows build is
+described in [WINDOWS.md](WINDOWS.md).
 
 ## How it works
 
@@ -98,15 +106,25 @@ clicked desk's session in its room's working directory, which is what gives
 airoom interrupts, per-tool approvals and message-level streaming without
 process cold starts. The SDK still writes the transcript to
 `~/.claude/projects`, so the file watcher animates the desk exactly as it does
-for a session started in a terminal. `AIROOM_ENGINE=cli` falls back to spawning
-the CLI per message, with no interrupts and no interactive approvals.
+for a session started in a terminal.
 
 Things worth knowing:
 
 - `--resume <id>` keeps the session id and appends to the same transcript, so a
   desk's identity is stable across airoom messages.
-- `/compact` can rewrite a session file in place; the parser keys its cache on
-  size and mtime and never assumes append-only.
+- `/compact` can rewrite a session file in place, so a file is only read from
+  where reading stopped when it provably just grew; otherwise it is read again
+  from the top.
+- Transcripts get large: every screenshot an agent reads is in there as
+  base64, and a long session passes a hundred megabytes while it is still
+  being written. They are never held whole in memory. Files are streamed a
+  line at a time, and a session still being written keeps its parse open, so
+  only the bytes it appended are read. "It only grew" is checked each time
+  (same file, same first bytes, same bytes before where reading stopped). A
+  desk keeps only its last few steps; the chat panel keeps a session's whole
+  history, for the three sessions opened last.
+  `scripts/transcript-scale-test.ts` proves it, including a 96 MB transcript
+  read inside a 96 MB heap.
 - Subagent transcripts live in `<project>/<sessionId>/subagents/` and are not
   desks.
 - A desk is an active session from the last seven days; the most recent session
@@ -169,6 +187,100 @@ it keeps its own, so the terminal sees exactly what the office does. Status come
 Sign-in for a connector that needs it happens in Claude Code (`/mcp`).
 `server/src/connectors.ts` holds it all; `scripts/connectors-test.ts` proves it.
 
+## The browser pane (a page your agents can drive)
+
+The desktop app's rail has a globe. It puts a real browser on the stage, in
+place of the office, with the agent's chat still docked beside it. It is laid
+out the way Chrome is: tabs with the page's icon and title and a new-tab
+button, back, forward and reload, the address bar, and a profile button at
+the right. Each tab is a `<webview>` with storage of its own, so what you sign
+in to there stays there, and nothing in it can reach airoom's own window.
+Chrome's keys work, from airoom or from inside a page: ⌘T, ⌘W, ⌘L, ⌘R,
+Ctrl+Tab, ⌘1 to ⌘9 (Ctrl in place of ⌘ on Windows). With the browser on the
+stage, ⌘W closes a tab and ⌘R reloads the page, not airoom's window. A link
+that opens a new window opens a new tab beside its own. A tab that is not
+showing keeps running, and up to sixteen can be open.
+
+Profiles are Chrome's idea of them. Each has its own cookies, storage and
+sign-ins; the button at the right of the toolbar switches, adds, renames and
+removes them. Switching keeps the address and opens it as the other profile,
+which is the point: the same page as an admin, as a customer, signed out.
+Guest is kept in memory only and is emptied when you leave it. These are
+airoom's profiles, not the ones in your Chrome: another browser's profile
+cannot be opened from here. An agent works in whichever profile is showing and
+is told its name, and a site cleared for an agent in one profile is not
+cleared in another.
+
+Every Claude run started from airoom carries twelve tools for that pane, as an
+in-process MCP server named `airoom-browser`: `navigate`, `snapshot`, `click`,
+`type`, `select`, `press`, `scroll`, `wait`, `screenshot`, `console`, `tabs`
+and `evaluate`. An agent works in a tab of its own: the first page it opens
+gets a new tab beside the one showing, unless that one is a blank New Tab, so
+a page you have open is never replaced. A link it clicks that opens a new
+window takes it into the new tab. `tabs` lists, opens and switches tabs, and
+closes the ones the agent opened (never one you had open). The tools are
+always loaded, never deferred behind tool search: a model that has to go
+looking for the tool that picks a dropdown option spends more than the tools
+cost. An agent reads a page as an outline of what is visible, with a ref on
+every element it can act on, and acts by ref.
+
+An agent acts on the page from inside it. A click is the events a click fires,
+in order, at the element's own position; text goes in through the browser's
+editing commands; a key press reaches the page's handlers and then does what
+the browser would have done with it. Nothing is sent through the window's
+mouse or keyboard, because a mouse press delivered that way moves the window's
+keyboard focus into the page, and whoever was typing a message to an agent
+would be typing into the app under test. It also means a test keeps running
+while the office is showing or the window is in the background. The price is
+fidelity at the edges: the events are not marked as trusted, CSS `:hover` does
+not apply, and a native dropdown is chosen from with `select`, not opened. No
+debugging port is opened.
+
+The pane lives in the shell, a separate process from the server. The shell
+already holds a socket to the server, so a tool call goes down that socket as
+a `browserCmd` and its answer comes back as a `browserResult`. Nothing new
+listens on the machine.
+
+- **What asks first.** Pages on this machine (`localhost`, `127.0.0.1`,
+  `*.localhost`) never raise a card. The first call that would read or act on
+  any other site goes through the ordinary approval, and one yes covers that
+  site for the rest of the run. Until then a page on such a site gives the
+  agent its address and nothing else. Bypass mode skips the card, as it does
+  for every tool.
+- **A tab each.** Agents work side by side, each in a tab of its own. A tab
+  stays with the agent working in it until that agent has been quiet for
+  twenty seconds; another agent that finds it showing is told to open a tab of
+  its own. What an agent may do is judged by the page in its own tab, not by
+  the one showing.
+- **Who is driving.** The toolbar names the agent while it acts, and its tab
+  carries a dot. The pane comes to the stage, and the agent's tab to the
+  front, by itself only when you are already at that agent's desk; otherwise
+  the rail lights up and the office stays where it is.
+
+**Use my Chrome.** The ⋮ menu (or ⌘K, "Agents use my Chrome") switches agents
+from these tabs to your own Chrome, with its real profiles and everything you
+are signed in to there. airoom does not open Chrome's data itself; it turns
+on Claude Code's own integration, Claude in Chrome (`--chrome`), for every run
+it starts. That needs the Claude in Chrome extension installed and signed in
+to the same Claude account, and Chrome open. The integration refuses
+long-lived tokens, so those runs use Claude Code's own sign-in (`/login`), not
+the token pasted into airoom; switching checks both, without spending tokens,
+and says what is missing. The policy is the same as in airoom's tabs: pages on
+this machine go through without a card, and the first step on any other site
+asks, with "always allow" clearing that site for the session. Running
+JavaScript in a page or uploading a file always asks. If several Chrome
+browsers are connected, the first agent asks which one, and Claude Code
+remembers the answer. The switch applies from the next message; it lives in
+`~/.airoom/browser.json`.
+
+`AIROOM_BROWSER=0` leaves the browser out of every run, airoom's tabs and
+Chrome alike. `desktop/browser.js` carries the commands out and keeps the
+tabs and profiles; `server/src/browser/` holds the relay, the policy, the
+tools and the Chrome switch; `scripts/browser-test.ts` proves the server
+half, `scripts/browser-shell-test.ts` the profiles and keys, and
+`scripts/browser-harness.ts` stands in for the server so the pane can be
+exercised against a real shell with no agent and no tokens.
+
 ## How status is derived
 
 Status heuristics live in `server/src/parse/sessionParser.ts`, pure and tested:
@@ -188,22 +300,26 @@ very old "your move" also decays to idle.
 ```
 shared/types.ts                      domain model + WS protocol (the contract)
 shared/describeTool.ts               one line per tool call, for the feed
+shared/browserUrl.ts                 what an address is, and which addresses are this machine
 server/src/index.ts                  http + WebSocket gateway, approvals
 server/src/datasource/               DataSource (read seam); LocalClaudeDataSource watches ~/.claude/projects
-server/src/parse/sessionParser.ts    JSONL → session model
+server/src/parse/sessionParser.ts    JSONL → session model, one record at a time
 server/src/agent/                    AgentController (write seam); SdkClaudeController (Agent SDK),
-                                     LocalClaudeController (CLI fallback), claudeBin (finding claude)
+                                     claudeBin (finding claude)
 server/src/team/                     TeamController + worktrees: a lead, a crew, one lane each
+server/src/browser/                  the browser pane's server half: relay to the shell, site policy, tools
 server/src/release.ts                the version check
 server/scripts/                      the test suite: plain tsx scripts, no framework
 web/src/net/useFleet.ts              WS client, reconnect, live snapshot + runs
 web/src/render/                      draw.ts (rooms, desks, monitors, name tags), sim.ts (who sits,
                                      who walks), PixelWorld.tsx (canvas, pan/zoom, hit testing)
 web/src/ui/                          AgentPanel (feed + composer), TeamPanel, HireTeam, Queue,
-                                     Palette (⌘K), RoomSettings, UpdateBar, …
+                                     Palette (⌘K), RoomSettings, UpdateBar, BrowserPane, …
 web/src/shell.css                    the control-room chrome
 desktop/main.js                      Electron shell: runs the server, window, tray badge,
                                      notifications, graceful quit
+desktop/browser.js                   the browser pane: a <webview> per tab, its profiles, and what
+                                     agents ask of it over the shell's own socket
 landing/                             airoom.dev: a dependency-free static server
 design/                              pixel-art tooling and scene previews
 scripts/scene.mjs                    stages rooms and agents on a running app, for screenshots
@@ -225,8 +341,7 @@ Windows workflow stays green. Security reports go to the address in
 
 ## Roadmap
 
-- Code-signed Windows builds ([WINDOWS-SIGNING.md](WINDOWS-SIGNING.md) has
-  the route).
+- Code-signed Windows builds.
 - A hosted office for a team, the paid product: the same client against
   remote `DataSource` and `AgentController` implementations.
 - Sprites and sound.

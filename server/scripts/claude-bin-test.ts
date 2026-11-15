@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { candidatePatterns, expandPattern, findClaudeBinSync, npmCliBeside, pickPathFromShellOutput, setupTokenCommand, type FsLike } from '../src/agent/claudeBin';
+import { candidatePatterns, expandPattern, findClaudeBinSync, pickPathFromShellOutput, setupTokenCommand, type FsLike } from '../src/agent/claudeBin';
 
 let passed = 0;
 const failures: [string, Error][] = [];
@@ -110,14 +110,6 @@ test('`where claude` output is read in PATH order, the first existing match wins
   assert.equal(pickPathFromShellOutput(out, () => true), 'C:\\Users\\u\\AppData\\Roaming\\npm\\claude.cmd');
   assert.equal(pickPathFromShellOutput(out, (p) => p.endsWith('.exe')), 'C:\\Users\\u\\.local\\bin\\claude.exe');
   assert.equal(pickPathFromShellOutput('INFO: Could not find files for the given pattern(s).\r\n', () => true), null);
-});
-
-test('an npm .cmd shim resolves to the cli.js it wraps, or to nothing', () => {
-  const shim = 'C:\\Users\\u\\AppData\\Roaming\\npm\\claude.cmd';
-  const cli = 'C:\\Users\\u\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js';
-  assert.equal(npmCliBeside(shim, fake([cli])), cli);
-  assert.equal(npmCliBeside(shim, fake([])), null);
-  assert.equal(npmCliBeside('C:\\Users\\u\\.local\\bin\\claude.exe', fake([])), null, 'only shims are unwrapped');
 });
 
 test('the connect card keeps the short command for a Windows PATH install, quotes the rest', () => {

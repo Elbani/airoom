@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useFocusTrap } from './useFocusTrap';
 import { createPortal } from 'react-dom';
-import type { RoleNotes, TeamAutonomy, TeamRole, ImageAttachment, Robot, RobotStatus, RunUpdate, Step } from '@shared/types';
+import type { TeamAutonomy, ImageAttachment, Robot, RobotStatus, RunUpdate, Step } from '@shared/types';
 import {
   PERMISSION_MODES,
   type AgentSkills,
@@ -18,6 +18,7 @@ import { PickerMenu } from './PickerMenu';
 import { API_BASE } from '../net/base';
 import { defaultAgentName } from '../names';
 import { splitToolLabel, toolMeta } from './toolMeta';
+import { relTime } from './Queue';
 
 interface Props {
   robot: Robot | null; // null = "+ new" mode for roomId — pick an agent or a team
@@ -2373,16 +2374,4 @@ function clock(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
   return `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
-
-function relTime(iso: string): string {
-  const ms = Date.now() - Date.parse(iso);
-  if (Number.isNaN(ms)) return iso;
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
 }

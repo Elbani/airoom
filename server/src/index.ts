@@ -11,7 +11,6 @@ import { LocalClaudeDataSource } from './datasource/LocalClaudeDataSource';
 import { MAX_STEPS } from './parse/sessionParser';
 import { PERMISSION_MODES } from '../../shared/types';
 import type { DataSource } from './datasource/DataSource';
-import { LocalClaudeController } from './agent/LocalClaudeController';
 import {
   SdkClaudeController,
   cachedCommands,
@@ -21,7 +20,6 @@ import {
   refreshOllama,
   engineDiagnostics,
 } from './agent/SdkClaudeController';
-import type { AgentController } from './agent/AgentController';
 import { FALLBACK_MODELS } from '../../shared/types';
 import { releaseState, startReleaseChecks } from './release';
 import { TeamController } from './team/TeamController';
@@ -30,7 +28,12 @@ import { addProjectServer, ConnectorsService, removeProjectServer, setAdopted, s
 import { gitFacts } from './team/worktrees';
 import { assignSkills, buildSkillPrompt, createUserSkill, discoverSkills, sanitizeAgentSkills, skillNamesFor, skillsFor } from './skills';
 import { agentNameFor, setAgentName } from './agentNames';
+import { BrowserBridge } from './browser/BrowserBridge';
+import { browserExtras } from './browser/tools';
+import { CHROME_ARGS, chromeCheck, chromeExtras } from './browser/chrome';
+import { loadBrowserAgents, saveBrowserAgents } from './browser/settings';
 import type {
+  ChromeCheck,
   ClientMessage,
   FleetSnapshot,
   PermissionMode,
@@ -46,65 +49,75 @@ const PORT = Number(process.env.PORT ?? 8787);
 // network — loopback only. Multi-user/remote is a future, authenticated seam.
 const HOST = '127.0.0.1';
 
-// --- Read path (local) and write path. Engine: Agent SDK by default —
-// interrupts + per-tool approvals; AIROOM_ENGINE=cli falls back to spawning
-// the claude CLI per message.
+// --- Read path (local) and write path: the Agent SDK, which gives interrupts
+// and per-tool approvals.
 const source: DataSource = new LocalClaudeDataSource();
-const controller: AgentController =
-  process.env.AIROOM_ENGINE === 'cli' ? new LocalClaudeController() : new SdkClaudeController();
-// The SDK controller learns the model list from the first live query; push it
-// to every open client the moment it does, so an empty picker fills itself in.
-if (controller instanceof SdkClaudeController) {
-  // Whatever learns a new model list (a Claude run, or Ollama appearing)
-  // broadcasts the MERGED list — pickers show one list, not two.
-  controller.onModels = () => broadcast({ v: 1, type: 'models', models: mergedModels() });
+const controller = new SdkClaudeController();
+// Whatever learns a new model list (a Claude run, or Ollama appearing)
+// broadcasts the MERGED list — pickers show one list, not two. The first live
+// query fills an empty picker in for every open client.
+controller.onModels = () => broadcast({ v: 1, type: 'models', models: mergedModels() });
+controller.onCommands = (commands) => broadcast({ v: 1, type: 'commands', commands });
 
-  controller.onCommands = (commands) => broadcast({ v: 1, type: 'commands', commands });
-}
+// Teams: their tools ride each query's in-process MCP server.
+const teams = new TeamController({
+  controller,
+  onUpdate: (update) => broadcast({ v: 1, type: 'run', update }),
+  onHandoff: (handoff) => broadcast({ v: 1, type: 'handoff', handoff }),
+  onTeamsChanged: () => void broadcastSnapshot(),
+  // Test harnesses run a second server against a scratch state file so
+  // real E2E team runs never touch the user's own teams.
+  ...(process.env.AIROOM_TEAMS_FILE ? { file: process.env.AIROOM_TEAMS_FILE } : {}),
+});
 
-// Teams need the SDK engine: their tools ride the query's in-process MCP
-// server, which the CLI fallback cannot host. On the CLI engine `teams` stays
-// null and hireTeam answers with a plain explanation instead of half-working.
-const teams: TeamController | null =
-  controller instanceof SdkClaudeController
-    ? new TeamController({
-        controller,
-        onUpdate: (update) => broadcast({ v: 1, type: 'run', update }),
-        onHandoff: (handoff) => broadcast({ v: 1, type: 'handoff', handoff }),
-        onTeamsChanged: () => void broadcastSnapshot(),
-        // Test harnesses run a second server against a scratch state file so
-        // real E2E team runs never touch the user's own teams.
-        ...(process.env.AIROOM_TEAMS_FILE ? { file: process.env.AIROOM_TEAMS_FILE } : {}),
-      })
-    : null;
-
-// Playbooks ride the same engine: extraction is a tool-less query, a run is a
-// session with a preamble and an allowlist. Absent on the CLI engine.
-const playbooks: PlaybookController | null =
-  controller instanceof SdkClaudeController
-    ? new PlaybookController({
-        controller,
-        getTranscript: (sessionId, limit) => source.getTranscript(sessionId, limit),
-        onUpdate: (update) => {
-          broadcast({ v: 1, type: 'run', update });
-          if (update.phase === 'permission' || update.phase === 'started') void broadcastSnapshot();
-        },
-        onChanged: () => {
-          broadcast({ v: 1, type: 'playbooks', playbooks: playbooks?.list() ?? [] });
-          void broadcastSnapshot();
-        },
-        ...(process.env.AIROOM_PLAYBOOKS_FILE ? { file: process.env.AIROOM_PLAYBOOKS_FILE } : {}),
-      })
-    : null;
+// Playbooks: extraction is a tool-less query, a run is a session with a
+// preamble and an allowlist.
+const playbooks: PlaybookController = new PlaybookController({
+  controller,
+  getTranscript: (sessionId, limit) => source.getTranscript(sessionId, limit),
+  onUpdate: (update) => {
+    broadcast({ v: 1, type: 'run', update });
+    if (update.phase === 'permission' || update.phase === 'started') void broadcastSnapshot();
+  },
+  onChanged: () => {
+    broadcast({ v: 1, type: 'playbooks', playbooks: playbooks.list() });
+    void broadcastSnapshot();
+  },
+  ...(process.env.AIROOM_PLAYBOOKS_FILE ? { file: process.env.AIROOM_PLAYBOOKS_FILE } : {}),
+});
 
 // Connectors: what each room's agents can reach. Cached per room; a live run
 // refreshes its room for free through the controller's status callback.
 const connectors = new ConnectorsService(controller, (room) => broadcast({ v: 1, type: 'connectors', room }));
-if (controller instanceof SdkClaudeController) controller.onMcpStatus = (cwd, raw) => connectors.ingest(cwd, raw);
+controller.onMcpStatus = (cwd, raw) => connectors.ingest(cwd, raw);
+
+// The browser: airoom's own tabs, which live in the desktop shell and are
+// driven over the shell's socket (no port), or the user's own Chrome through
+// Claude in Chrome. AIROOM_BROWSER=0 leaves both out.
+const browser = new BrowserBridge((host, msg) => send(host as WebSocket, msg));
+let browserAgents = loadBrowserAgents();
+/** What runs carry. One function, so a warm run is never reused across a change. */
+const browserMode = (): 'chrome' | 'pane' | 'none' =>
+  process.env.AIROOM_BROWSER === '0' ? 'none' : browserAgents === 'chrome' ? 'chrome' : browser.connected ? 'pane' : 'none';
+controller.runExtras = (ctx) => {
+  const mode = browserMode();
+  return mode === 'chrome' ? chromeExtras() : mode === 'pane' ? browserExtras(browser, ctx) : null;
+};
+controller.runExtrasKey = browserMode;
+/** Tell everyone whether agents can use the user's Chrome: checking first, then the answer. */
+async function checkChrome() {
+  broadcast({ v: 1, type: 'chromeCheck', check: { state: 'checking', text: 'Checking Claude Code and Claude in Chrome…' } });
+  let check: ChromeCheck;
+  try {
+    check = chromeCheck(await controller.probe(os.homedir(), { extraArgs: CHROME_ARGS, ownLogin: true, account: true }));
+  } catch (err) {
+    check = { state: 'problem', text: String((err as Error)?.message ?? err).slice(0, 300) };
+  }
+  broadcast({ v: 1, type: 'chromeCheck', check });
+}
 
 /** Overlay playbook truth: which robots are runs of which card. */
 function withPlaybookOverlay(snapshot: FleetSnapshot): FleetSnapshot {
-  if (!playbooks) return snapshot;
   return {
     ...snapshot,
     robots: snapshot.robots.map((robot) => {
@@ -122,7 +135,6 @@ function withPlaybookOverlay(snapshot: FleetSnapshot): FleetSnapshot {
 /** Overlay team truth: which robots belong to teams, and which rooms have a
  *  parked team waving for the human. */
 function withTeamOverlay(snapshot: FleetSnapshot): FleetSnapshot {
-  if (!teams) return snapshot;
   const waving = teams.roomsAwaitingHuman();
   // A lane is a git worktree with sessions in it, so the fleet scan finds it
   // and calls it a project. It is not one — it is a room off the project it
@@ -469,7 +481,7 @@ const server = http.createServer((req, res) => {
     // `busy` answers the one question nothing could answer before: is airoom in
     // the middle of something? Quitting the app takes every run with it, and
     // there was no way — for a person or a script — to check first.
-    const working = (teams?.list() ?? []).filter((x) => x.state === 'working');
+    const working = teams.list().filter((x) => x.state === 'working');
     res.end(
       JSON.stringify({
         ok: true,
@@ -479,6 +491,10 @@ const server = http.createServer((req, res) => {
           teams: working.length,
           teamNames: working.map((x) => x.name || x.task.split('\n')[0].slice(0, 60)),
         },
+        browser: { ...browser.status(), agents: browserAgents },
+        // What reading the transcripts has cost so far (bytes, whole-file reads,
+        // appended reads): the number to look at when the office feels heavy.
+        transcripts: (source as { stats?: () => unknown }).stats?.(),
       }),
     );
     return;
@@ -581,6 +597,7 @@ wss.on('connection', (ws) => {
     send(ws, { v: 1, type: 'models', models: models.length ? models : FALLBACK_MODELS });
     const commands = cachedCommands();
     if (commands.length) send(ws, { v: 1, type: 'commands', commands });
+    send(ws, { v: 1, type: 'browserSettings', agents: browserAgents });
     if (playbooks) send(ws, { v: 1, type: 'playbooks', playbooks: playbooks.list() });
     // Replay any approval still waiting on a human. The snapshot alone only
     // says a robot "needs your approval" — the Allow/Deny card is driven by a
@@ -624,6 +641,23 @@ wss.on('connection', (ws) => {
     // Validate the shape here, and treat any throw below as a bad frame.
     const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
     try {
+      // The desktop shell, speaking for its browser pane.
+      if (msg.type === 'browserHost') {
+        browser.attachHost(ws, msg.state);
+        return;
+      }
+      if (msg.type === 'browserResult') {
+        browser.onResult(ws, msg);
+        return;
+      }
+      if (msg.type === 'setBrowserAgents') {
+        browserAgents = msg.agents === 'chrome' ? 'chrome' : 'pane';
+        const err = saveBrowserAgents(browserAgents);
+        if (err) send(ws, { v: 1, type: 'notice', text: err, isError: true });
+        broadcast({ v: 1, type: 'browserSettings', agents: browserAgents });
+        if (browserAgents === 'chrome') void checkChrome();
+        return;
+      }
       if (msg.type === 'subscribe') {
         const sessionId = str(msg.sessionId);
         if (!sessionId) return;
@@ -660,19 +694,19 @@ wss.on('connection', (ws) => {
         // Without this, any direct message (and EVERY message after a
         // restart, when no equipped run survives) resumed the member bare:
         // the reviewer lost give_verdict, the lead lost finish.
-        const equip = sessionId ? (teams?.directSendEquipment(sessionId) ?? null) : null;
+        const equip = sessionId ? teams.directSendEquipment(sessionId) : null;
         // A playbook run keeps its card and its allowlist on every follow-up,
         // and the follow-up itself is counted as supervision.
-        const book = sessionId && !equip ? (playbooks?.equipmentFor(sessionId) ?? null) : null;
+        const book = sessionId && !equip ? playbooks.equipmentFor(sessionId) : null;
         // A model picked in this member's panel must outlive this run — team
         // assignments used to snap the member back to the team-wide model.
         if (equip && sessionId && typeof msg.model === 'string' && msg.model)
-          teams?.noteMemberModel(sessionId, msg.model);
+          teams.noteMemberModel(sessionId, msg.model);
         let identitySaved = (!loadout && !hireName) || !!sessionId;
         // The team must know this turn answers the HUMAN: a member that
         // replies to you without a tool call is conversing, not stalling, and
         // nagging it would inject "call your tool" into your own chat.
-        if (equip && sessionId) teams?.noteDirectSend(sessionId);
+        if (equip && sessionId) teams.noteDirectSend(sessionId);
         // Run updates go to every client (all tabs see the same fleet state).
         // The engine also appends to the session transcript on disk, so the
         // file watcher refreshes snapshots as the agent works.
@@ -721,15 +755,10 @@ wss.on('connection', (ws) => {
         const sessionId = str(msg.sessionId);
         const roomId = str(msg.roomId);
         if (!sessionId || !roomId) return;
-        if (!playbooks) {
-          send(ws, { v: 1, type: 'playbookDraft', sessionId, error: 'Playbooks need the SDK engine (unset AIROOM_ENGINE=cli).' });
-          return;
-        }
         // Extraction is a model call and takes a while; the socket must not
         // block on it (an approval could arrive for another agent meanwhile).
         void playbooks.draft(sessionId, roomId).then((r) => send(ws, { v: 1, type: 'playbookDraft', sessionId, ...r }));
       } else if (msg.type === 'playbookSave') {
-        if (!playbooks) return;
         const r = playbooks.save(msg.playbook);
         send(ws, {
           v: 1,
@@ -739,11 +768,11 @@ wss.on('connection', (ws) => {
         });
       } else if (msg.type === 'playbookDelete') {
         const id = str(msg.id);
-        if (!id || !playbooks) return;
+        if (!id) return;
         if (!playbooks.delete(id)) send(ws, { v: 1, type: 'notice', text: 'No such playbook.', isError: true });
       } else if (msg.type === 'playbookRun') {
         const id = str(msg.id);
-        if (!id || !playbooks) return;
+        if (!id) return;
         const pb = playbooks.get(id);
         if (!pb) {
           send(ws, { v: 1, type: 'notice', text: 'No such playbook.', isError: true });
@@ -756,18 +785,18 @@ wss.on('connection', (ws) => {
       } else if (msg.type === 'playbookRule') {
         const id = str(msg.id);
         const text = str(msg.text);
-        if (!id || !text || !playbooks) return;
+        if (!id || !text) return;
         const r = playbooks.addRule(id, text, str(msg.runId) || undefined);
         send(ws, { v: 1, type: 'notice', text: r.ok ? 'Remembered — it is a rule on the card now.' : (r.error ?? 'Could not add that rule.'), isError: !r.ok });
       } else if (msg.type === 'playbookDropRule') {
         const id = str(msg.id);
         const ruleId = str(msg.ruleId);
-        if (!id || !ruleId || !playbooks) return;
+        if (!id || !ruleId) return;
         playbooks.dropRule(id, ruleId);
       } else if (msg.type === 'playbookStop') {
         const id = str(msg.id);
         const runId = str(msg.runId);
-        if (!id || !runId || !playbooks) return;
+        if (!id || !runId) return;
         playbooks.stop(id, runId);
         void broadcastSnapshot();
       } else if (msg.type === 'listConnectors') {
@@ -888,10 +917,10 @@ wss.on('connection', (ws) => {
       } else if (msg.type === 'setMode') {
       const runKey = str(msg.runKey);
       if (!runKey || !msg.mode) return;
-      controller.setMode?.(runKey, msg.mode);
+      controller.setMode(runKey, msg.mode);
       // If this session is a team member, the choice must outlive the current
       // run — team assignments used to quietly revert it on the next send.
-      teams?.noteMemberMode(runKey, msg.mode);
+      teams.noteMemberMode(runKey, msg.mode);
     } else if (msg.type === 'startOllama') {
       const r = startOllama();
       if (!r.started) {
@@ -902,29 +931,22 @@ wss.on('connection', (ws) => {
       watchOllamaComeUp();
     } else if (msg.type === 'warmLocal') {
       const m = str(msg.model);
-      if (m) controller.warmLocal?.(m);
+      if (m) controller.warmLocal(m);
     } else if (msg.type === 'setFastMode') {
       const runKey = str(msg.runKey);
       if (!runKey) return;
-      controller.setFastMode?.(runKey, !!msg.fast);
+      controller.setFastMode(runKey, !!msg.fast);
     } else if (msg.type === 'rewind') {
       const runKey = str(msg.runKey);
       const userMessageId = str(msg.userMessageId);
       if (!runKey || !userMessageId) return;
-      const res = (await controller.rewind?.(runKey, userMessageId, !!msg.dryRun, {
+      const res = await controller.rewind(runKey, userMessageId, !!msg.dryRun, {
         roomId: str(msg.roomId) || undefined,
         sessionId: str(msg.sessionId) || undefined,
-      })) ?? {
-        canRewind: false,
-        error: 'Rewind is not supported by this engine.',
-      };
+      });
       send(ws, { v: 1, type: 'rewound', userMessageId, dryRun: !!msg.dryRun, ...res });
       if (!msg.dryRun && res.canRewind) void broadcastSnapshot();
     } else if (msg.type === 'hireTeam') {
-      if (!teams) {
-        send(ws, { v: 1, type: 'notice', text: 'Teams need the SDK engine (unset AIROOM_ENGINE=cli).', isError: true });
-        return;
-      }
       // Per-role overrides arrive from the hire form; only known modes and
       // sane model strings survive — this is a websocket anyone local can open.
       const roleModes: Partial<Record<TeamRole, PermissionMode>> = {};
@@ -951,31 +973,31 @@ wss.on('connection', (ws) => {
       if (!r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not hire a team.', isError: true });
       else if (r.notice) send(ws, { v: 1, type: 'notice', text: r.notice });
     } else if (msg.type === 'teamTask') {
-      const r = teams?.newTask(msg.teamId, msg.task);
-      if (r && !r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not give them that task.', isError: true });
+      const r = teams.newTask(msg.teamId, msg.task);
+      if (!r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not give them that task.', isError: true });
     } else if (msg.type === 'teamContinue') {
-      if (teams && !teams.continue_(msg.teamId))
+      if (!teams.continue_(msg.teamId))
         send(ws, { v: 1, type: 'notice', text: 'Nothing is waiting on you for that team.', isError: true });
     } else if (msg.type === 'teamCancelTask') {
-      const r = teams?.cancelTask(msg.teamId, msg.taskId);
-      if (r && !r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not cancel that task.', isError: true });
+      const r = teams.cancelTask(msg.teamId, msg.taskId);
+      if (!r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not cancel that task.', isError: true });
     } else if (msg.type === 'teamMergeTask') {
-      const r = teams?.mergeTask(msg.teamId, msg.taskId);
-      if (r && !r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not merge that lane.', isError: true });
-      else if (r?.ok) send(ws, { v: 1, type: 'notice', text: 'Lane merged into the project.' });
+      const r = teams.mergeTask(msg.teamId, msg.taskId);
+      if (!r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not merge that lane.', isError: true });
+      else send(ws, { v: 1, type: 'notice', text: 'Lane merged into the project.' });
     } else if (msg.type === 'teamCloseTask') {
-      const r = teams?.closeTaskByHuman(msg.teamId, msg.taskId);
-      if (r && !r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not close that task.', isError: true });
+      const r = teams.closeTaskByHuman(msg.teamId, msg.taskId);
+      if (!r.ok) send(ws, { v: 1, type: 'notice', text: r.error ?? 'Could not close that task.', isError: true });
     } else if (msg.type === 'nameTeam') {
-      if (teams && !teams.rename(msg.teamId, String(msg.name ?? '')))
+      if (!teams.rename(msg.teamId, String(msg.name ?? '')))
         send(ws, { v: 1, type: 'notice', text: 'No such team.', isError: true });
     } else if (msg.type === 'teamStop') {
-      teams?.stop(msg.teamId);
+      teams.stop(msg.teamId);
     } else if (msg.type === 'teamDismiss') {
       // Say what is about to be thrown away BEFORE throwing it away: the
       // worktrees go, and a branch nobody merged is work that only exists there.
-      const left = teams?.unmergedBranches(msg.teamId) ?? [];
-      if (teams && !teams.dismiss(msg.teamId))
+      const left = teams.unmergedBranches(msg.teamId);
+      if (!teams.dismiss(msg.teamId))
         send(ws, { v: 1, type: 'notice', text: 'Stop the team before dismissing it.', isError: true });
       else if (left.length)
         send(ws, {
@@ -993,9 +1015,9 @@ wss.on('connection', (ws) => {
       // A team member cannot be sent home mid-job: the lead would keep routing
       // work to a desk nobody is sitting at, and the team would hang waiting
       // for a report that can never come.
-      const member = msg.hidden ? teams?.memberOf(msg.sessionId) : undefined;
+      const member = msg.hidden ? teams.memberOf(msg.sessionId) : undefined;
       if (member) {
-        const t = teams?.list().find((x) => x.id === member.id);
+        const t = teams.list().find((x) => x.id === member.id);
         if (t && (t.state === 'working' || t.state === 'awaiting_human')) {
           send(ws, {
             v: 1,
@@ -1020,9 +1042,9 @@ wss.on('connection', (ws) => {
         send(ws, { v: 1, type: 'notice', text: 'This build cannot delete conversations.', isError: true });
         return;
       }
-      const member = teams?.memberOf(msg.sessionId);
+      const member = teams.memberOf(msg.sessionId);
       if (member) {
-        const t = teams?.list().find((x) => x.id === member.id);
+        const t = teams.list().find((x) => x.id === member.id);
         if (t && (t.state === 'working' || t.state === 'awaiting_human')) {
           send(ws, { v: 1, type: 'notice', text: `That agent is the ${member.role} on a running team. Stop the team first.`, isError: true });
           return;
@@ -1077,6 +1099,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     clients.delete(ws);
+    browser.detachHost(ws); // if this was the shell, its pane went with it
     console.log(`client disconnected (${clients.size} total)`);
   });
 });
@@ -1114,7 +1137,7 @@ server.listen(PORT, HOST, () => {
   // HOME on purpose: the answer is about this machine, not any project — and
   // using the first room (usually somewhere in ~/Documents) made macOS ask
   // for Documents access at first launch, before the user had done anything.
-  void controller.prewarm?.(os.homedir()).catch(() => {
+  void controller.prewarm(os.homedir()).catch(() => {
     /* no runtime yet — the cached lists still stand */
   });
   // Local models: cheap probe of Ollama's tags, at boot and every 30s, so
@@ -1145,7 +1168,7 @@ async function shutdown() {
   setTimeout(() => process.exit(0), 4000).unref();
   // Teams first: their members are about to be killed, and this is the only
   // moment we still know the cause was a quit rather than a failure.
-  teams?.shutDown();
+  teams.shutDown();
   await source.close();
   await controller.close();
   for (const client of wss.clients) client.terminate();

@@ -294,9 +294,56 @@ export const FALLBACK_MODELS: ModelChoice[] = [
   { value: '', displayName: 'Default', description: "Whatever your Claude Code is set to", primary: true },
 ];
 
-// ---- Wire protocol (versioned so we can evolve it without breaking clients) ----
+// ---- The browser pane ----
+//
+// The desktop shell hosts one browser pane inside the airoom window. People
+// use it like any browser; agents drive it through the `airoom-browser` tools,
+// which the server relays to the shell over the shell's own socket.
 
-export const PROTOCOL_VERSION = 1 as const;
+/** What the desktop shell reports about its browser pane. */
+export interface BrowserPaneState {
+  /** A window exists that can show the pane. */
+  available: boolean;
+  /**
+   * The browser profile in use. Each has its own cookies and sign-ins, so
+   * the same address can be a different page in another profile.
+   */
+  profile: { id: string; name: string } | null;
+  /** Every tab, in order. */
+  tabs: { id: string; url: string }[];
+  /** The tab showing. */
+  active: string | null;
+  /** The tab each agent works in, by run key. */
+  drivers: Record<string, string>;
+}
+
+/** Where agents browse: airoom's own tabs, or the user's own Chrome. */
+export type BrowserAgents = 'pane' | 'chrome';
+/** Whether agents can use the user's Chrome, in a sentence. */
+export interface ChromeCheck {
+  state: 'checking' | 'ready' | 'problem';
+  text: string;
+}
+
+/** Everything an agent can ask the pane to do. */
+export type BrowserAction =
+  | 'navigate'
+  | 'snapshot'
+  | 'screenshot'
+  | 'click'
+  | 'type'
+  | 'press'
+  | 'select'
+  | 'scroll'
+  | 'wait'
+  | 'console'
+  | 'evaluate'
+  | 'tabs';
+
+/** Who is asking: the run behind a browser command. */
+export type BrowserDriver = Pick<RunUpdate, 'runKey' | 'sessionId' | 'roomId'>;
+
+// ---- Wire protocol (every message carries `v: 1`, so it can evolve without breaking clients) ----
 
 export type ServerMessage =
   | { v: 1; type: 'snapshot'; snapshot: FleetSnapshot }
@@ -340,9 +387,22 @@ export type ServerMessage =
   // live run in that room reports fresher status).
   | { v: 1; type: 'connectors'; room: RoomConnectors }
   // Answer to 'playbookDraft': what airoom read out of the session, unsaved.
-  | { v: 1; type: 'playbookDraft'; sessionId: string; draft?: Playbook; error?: string };
+  | { v: 1; type: 'playbookDraft'; sessionId: string; draft?: Playbook; error?: string }
+  // One browser command, sent ONLY to the socket that announced itself as the
+  // pane's host (the desktop shell). Answered with 'browserResult'.
+  | { v: 1; type: 'browserCmd'; id: string; action: BrowserAction; args: Record<string, unknown>; driver: BrowserDriver }
+  // Where agents browse, sent on connect and whenever it changes.
+  | { v: 1; type: 'browserSettings'; agents: BrowserAgents }
+  // Whether agents can use the user's Chrome, while it is checked and after.
+  | { v: 1; type: 'chromeCheck'; check: ChromeCheck };
 
 export type ClientMessage =
+  // The desktop shell hosts the browser pane: it reports the pane's state
+  // (on connect and on every change) and answers the commands agents send.
+  | { v: 1; type: 'browserHost'; state: BrowserPaneState }
+  | { v: 1; type: 'browserResult'; id: string; ok: boolean; result?: unknown; error?: string }
+  // Where agents browse. 'chrome' also checks that it can work.
+  | { v: 1; type: 'setBrowserAgents'; agents: BrowserAgents }
   // Request a transcript window: the most recent `limit` steps of a session.
   // Scrolling to the top re-subscribes with a larger limit.
   | { v: 1; type: 'subscribe'; sessionId: string; limit?: number }

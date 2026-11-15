@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -7,7 +7,16 @@ import {
   type Query,
   type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import { runKeyFor, type ActiveRun, type AgentController, type AskResult, type RawMcpStatus, type SendOptions } from './AgentController';
+import {
+  runKeyFor,
+  type ActiveRun,
+  type AgentController,
+  type AskResult,
+  type RawMcpStatus,
+  type RunExtras,
+  type RunExtrasContext,
+  type SendOptions,
+} from './AgentController';
 import { allowedByRules } from '../playbook/rules';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import type {
@@ -45,6 +54,21 @@ function authToken(): { token: string; source: 'env' | 'file' } | null {
     /* no token file */
   }
   return null;
+}
+
+const LOGIN_OVERRIDES = new Set(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']);
+
+/**
+ * The environment for a Claude Code process. `ownLogin` signs it in with
+ * Claude Code's own login (/login): no token and no key. Otherwise airoom's
+ * token, when one was given. Undefined means "inherit as is".
+ */
+function engineEnv(ownLogin: boolean, extra?: Record<string, string>): Record<string, string> | undefined {
+  const auth = ownLogin ? null : authToken();
+  if (!ownLogin && !auth && !extra) return undefined;
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !(ownLogin && LOGIN_OVERRIDES.has(k))) env[k] = v;
+  return { ...env, ...(auth ? { CLAUDE_CODE_OAUTH_TOKEN: auth.token } : {}), ...extra };
 }
 
 /** What the engine sees — surfaced on /health so auth issues are diagnosable. */
@@ -185,19 +209,17 @@ function rememberModels(list: ModelChoice[], onChange: (m: ModelChoice[]) => voi
 async function withControlQuery<T>(
   options: Record<string, unknown>,
   use: (q: Query) => Promise<T>,
+  how: { ownLogin?: boolean } = {},
 ): Promise<T> {
   let close: () => void = () => {};
   const input: AsyncIterable<SDKUserMessage> = (async function* () {
     await new Promise<void>((resolve) => (close = resolve));
   })();
-  const auth = authToken();
   const q = query({
     prompt: input,
     options: {
       pathToClaudeCodeExecutable: claudeBin(),
-      env: auth
-        ? ({ ...process.env, CLAUDE_CODE_OAUTH_TOKEN: auth.token } as Record<string, string>)
-        : undefined,
+      env: engineEnv(!!how.ownLogin),
       ...options,
     },
   });
@@ -339,6 +361,7 @@ interface Run {
   budgetUsd: number; // 0 = uncapped; fixed at query creation like mode/model
   mode: PermissionMode; // the mode this query was CREATED with…
   model: string; // …and the model; both decide whether a run can be reused
+  extrasKey: string; // …and so does the host equipment it was given
 }
 
 /**
@@ -444,6 +467,17 @@ export class SdkClaudeController implements AgentController {
   onCommands: (commands: CommandChoice[]) => void = () => {};
   /** A live run just reported its MCP servers — fresher than any cache. */
   onMcpStatus: (cwd: string, servers: RawMcpStatus[]) => void = () => {};
+  /**
+   * Host seam: equipment every Claude run carries, asked for once when the
+   * run's query is created. Null by default; the gateway sets it.
+   */
+  runExtras: ((ctx: RunExtrasContext) => RunExtras | null) | null = null;
+  /**
+   * Names the equipment runExtras hands out right now. A warm run built with
+   * other equipment is not reused for the next message: switching where
+   * agents browse takes effect on the next message, not two minutes later.
+   */
+  runExtrasKey: (() => string) | null = null;
   private pendingByRequest = new Map<string, PendingPermission>();
   private permCounter = 0;
 
@@ -494,17 +528,36 @@ export class SdkClaudeController implements AgentController {
    * asked again after a moment inside the same process.
    */
   async mcpStatus(cwd: string): Promise<RawMcpStatus[]> {
-    if (!existsSync(cwd) || !claudeBin()) return [];
-    return withControlQuery({ cwd }, async (q) => {
-      const read = async () => ((await q.mcpServerStatus?.().catch(() => null)) ?? []) as RawMcpStatus[];
-      let list = await read();
-      for (let i = 0; i < 3 && list.some((s) => s.status === 'pending'); i++) {
-        await new Promise((r) => setTimeout(r, 1500));
-        list = await read();
-      }
-      return list;
-    });
+    return (await this.probe(cwd)).servers;
   }
+
+  /**
+   * MCP servers with their health and, when asked, who Claude Code is signed
+   * in as: a control-only query, a process spawn and no tokens. `extraArgs`
+   * and `ownLogin` start it the way a run with that equipment starts.
+   */
+  async probe(
+    cwd: string,
+    how: { extraArgs?: Record<string, string | null>; ownLogin?: boolean; account?: boolean } = {},
+  ): Promise<{ servers: RawMcpStatus[]; account: { email?: string } | null; signedIn: boolean }> {
+    if (!existsSync(cwd) || !claudeBin()) return { servers: [], account: null, signedIn: false };
+    return withControlQuery(
+      { cwd, ...(how.extraArgs ? { extraArgs: how.extraArgs } : {}) },
+      async (q) => {
+        const account = how.account ? ((await q.accountInfo?.().catch(() => null)) ?? null) : null;
+        const read = async () => ((await q.mcpServerStatus?.().catch(() => null)) ?? []) as RawMcpStatus[];
+        let servers = await read();
+        for (let i = 0; i < 3 && servers.some((s) => s.status === 'pending'); i++) {
+          await new Promise((r) => setTimeout(r, 1500));
+          servers = await read();
+        }
+        return { servers, account, signedIn: !!account && (!!account.email || !!account.tokenSource || !!account.subscriptionType) };
+      },
+      { ownLogin: how.ownLogin },
+    );
+  }
+
+
 
   /**
    * One question, answered by a session that holds no tools and is thrown
@@ -515,7 +568,6 @@ export class SdkClaudeController implements AgentController {
   async ask(cwd: string, prompt: string, opts: { model?: string; maxTurns?: number } = {}): Promise<AskResult> {
     if (!existsSync(cwd)) return { ok: false, error: `The folder no longer exists on disk (${cwd}).` };
     if (!claudeBin()) return { ok: false, error: NOT_FOUND_MESSAGE };
-    const auth = authToken();
     const text: string[] = [];
     try {
       const q = query({
@@ -524,7 +576,7 @@ export class SdkClaudeController implements AgentController {
           cwd,
           ...(opts.model ? { model: opts.model } : {}),
           pathToClaudeCodeExecutable: claudeBin(),
-          env: auth ? ({ ...process.env, CLAUDE_CODE_OAUTH_TOKEN: auth.token } as Record<string, string>) : undefined,
+          env: engineEnv(false),
           tools: [],
           maxTurns: opts.maxTurns ?? 1,
           // Nothing to keep: a transcript of this would appear in the office
@@ -624,7 +676,8 @@ export class SdkClaudeController implements AgentController {
       const sameSettings =
         existing.mode === mode &&
         existing.model === (model ?? '') &&
-        existing.budgetUsd === (budgetUsd ?? 0);
+        existing.budgetUsd === (budgetUsd ?? 0) &&
+        existing.extrasKey === (this.runExtrasKey?.() ?? '');
       if (existing.busy || sameSettings) {
         if (existing.keepalive) {
           clearTimeout(existing.keepalive);
@@ -682,24 +735,22 @@ export class SdkClaudeController implements AgentController {
       budgetUsd: budgetUsd ?? 0,
       mode,
       model: model ?? '',
+      extrasKey: this.runExtrasKey?.() ?? '',
     };
 
-    const auth = authToken();
     // A local model is not a different engine: Claude Code honours
     // ANTHROPIC_BASE_URL, so the same binary runs against Ollama's
     // Anthropic-compatible endpoint. The model value arrives as
     // `ollama/<name>`; the runtime gets the bare name and the redirect env.
     const local = isOllamaModel(model);
     const runModel = local && model ? ollamaName(model) : model;
-    const runEnv: Record<string, string> | undefined =
-      auth || local
-        ? ({
-            ...process.env,
-            ...(auth ? { CLAUDE_CODE_OAUTH_TOKEN: auth.token } : {}),
-            ...(local && model ? localRunEnv(ollamaName(model)) : {}),
-          } as Record<string, string>)
-        : undefined;
+    // The host's own equipment (the browser, or the user's Chrome). Local
+    // models are left out: their tool set is cut to what their size can carry.
+    const extras = local ? null : (this.runExtras?.({ roomId, runKey: key, sessionId: () => run.sessionId }) ?? null);
+    const runEnv = engineEnv(!!extras?.ownLogin, local && model ? localRunEnv(ollamaName(model)) : undefined);
     if (local && model) void this.checkLocalRuntime(model);
+    const allServers = mcpServers || extras?.mcpServers ? { ...(mcpServers ?? {}), ...(extras?.mcpServers ?? {}) } : null;
+    const promptAppend = [systemPromptAppend, extras?.systemPromptAppend].filter(Boolean).join('\n\n') || undefined;
     let q: Query;
     try {
       q = query({
@@ -731,10 +782,9 @@ export class SdkClaudeController implements AgentController {
           disallowedTools: ['AskUserQuestion', ...(extraDisallowedTools ?? [])],
           // Host extras (the team layer): in-process MCP tools, and a role
           // preamble appended to the standard Claude Code prompt.
-          ...(mcpServers ? { mcpServers: mcpServers as never } : {}),
-          ...(systemPromptAppend
-            ? { systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend } }
-            : {}),
+          ...(allServers ? { mcpServers: allServers as never } : {}),
+          ...(extras?.extraArgs ? { extraArgs: extras.extraArgs } : {}),
+          ...(promptAppend ? { systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: promptAppend } } : {}),
           // Braces: canUseTool is installed in BOTH modes. Under bypass it
           // still denies the question dialog and allows everything else.
           canUseTool: (toolName, toolInput, opts) => {
@@ -761,6 +811,16 @@ export class SdkClaudeController implements AgentController {
             // approve them regardless of mode, before any card is raised.
             if (autoAllow.some((p) => toolName.startsWith(p)))
               return Promise.resolve<PermissionResult>({ behavior: 'allow', updatedInput: toolInput });
+            // …and so does the host's equipment, call by call: the browser
+            // pane opens the app on this machine freely and asks before it
+            // touches anyone else's site.
+            const auto = extras?.autoAllowTool?.(toolName, toolInput, opts.suggestions as unknown[] | undefined);
+            if (auto)
+              return Promise.resolve<PermissionResult>(
+                auto !== true && auto.rules.length
+                  ? ({ behavior: 'allow', updatedInput: toolInput, updatedPermissions: auto.rules } as PermissionResult)
+                  : { behavior: 'allow', updatedInput: toolInput },
+              );
             // Honour the run's CURRENT mode, not the one it was created with —
             // the mode picker and "always allow" both change it mid-run. And
             // once a host installs canUseTool the runtime delegates every

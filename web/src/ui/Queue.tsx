@@ -32,6 +32,18 @@ interface Row {
     | { kind: 'merge'; teamId: string; taskId: string };
 }
 
+/** "40s ago", "5m ago", "3h ago", "2d ago" — when something last happened. */
+export function relTime(iso: string | null, now = Date.now()): string {
+  if (!iso) return '';
+  const s = Math.round((now - Date.parse(iso)) / 1000);
+  if (Number.isNaN(s)) return '';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
 /** "4 min", "1 h 12 min", "3 d" — the age of a wait, coarse on purpose. */
 export function ago(iso: string | null, now = Date.now()): string {
   if (!iso) return '';

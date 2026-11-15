@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { AgentController, RawMcpStatus } from './agent/AgentController';
+import { readJson, writeJsonAtomic } from './jsonFile';
 import type { Connector, RoomConnectors } from '../../shared/types';
 
 /**
@@ -85,22 +85,6 @@ export function toConnectors(raw: RawMcpStatus[]): Connector[] {
 
 interface McpJson {
   mcpServers?: Record<string, Record<string, unknown>>;
-}
-
-function readJson<T>(file: string): T | null {
-  try {
-    return JSON.parse(readFileSync(file, 'utf8')) as T;
-  } catch {
-    return null;
-  }
-}
-
-/** Write a JSON file the way the runtime would find it: whole, or not at all. */
-function writeJsonAtomic(file: string, data: unknown) {
-  mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.airoom-tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
-  renameSync(tmp, file);
 }
 
 /** Servers declared in the project's .mcp.json, by name. */
